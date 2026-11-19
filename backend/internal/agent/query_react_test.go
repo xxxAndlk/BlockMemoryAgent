@@ -40,9 +40,9 @@ func TestQueryBoard_TreeSynthesis_StatusMapping(t *testing.T) {
 		t.Fatalf("期望 5 条合成任务, got %d", len(snap.Tasks))
 	}
 	want := map[string]board.TaskStatus{
-		"domain-1": board.TaskDone,        // Idle 翻绿（任务 113）
-		"domain-2": board.TaskUnverified,  // 标黄不标红（任务 89）
-		"domain-3": board.TaskBlocked,     // Paused 展示为阻塞
+		"domain-1": board.TaskDone,       // Idle 翻绿（任务 113）
+		"domain-2": board.TaskUnverified, // 标黄不标红（任务 89）
+		"domain-3": board.TaskBlocked,    // Paused 展示为阻塞
 		"domain-4": board.TaskFailed,
 		"domain-5": board.TaskInProgress,
 	}

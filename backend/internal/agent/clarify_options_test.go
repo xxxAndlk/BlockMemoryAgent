@@ -84,18 +84,18 @@ func TestResolveApproval(t *testing.T) {
 	}}
 	cases := map[string]bool{
 		// 选项 ID / 序号 / Label 直接裁决。
-		"confirm":   true,
-		"1":         true,
-		"确认执行":   true,
-		"reject":    false,
-		"2":         false,
-		"拒绝取消":   false,
+		"confirm": true,
+		"1":       true,
+		"确认执行":    true,
+		"reject":  false,
+		"2":       false,
+		"拒绝取消":    false,
 		// 未命中回退关键词（自由文本兑底）。
-		"确认":       true,
-		"yes":       true,
-		"拒绝":       false,
-		"随便吧":     false,
-		"":          false,
+		"确认":  true,
+		"yes": true,
+		"拒绝":  false,
+		"随便吧": false,
+		"":    false,
 	}
 	for answer, want := range cases {
 		if got := resolveApproval(answer, pc); got != want {
@@ -142,8 +142,8 @@ func TestApprovalHook_StructuredOptions(t *testing.T) {
 		answer    string
 		wantWrite bool
 	}{
-		{"1", true},   // 序号 1 = 确认执行
-		{"2", false},  // 序号 2 = 拒绝取消
+		{"1", true},  // 序号 1 = 确认执行
+		{"2", false}, // 序号 2 = 拒绝取消
 		{"reject", false},
 	} {
 		t.Run(tc.answer, func(t *testing.T) {

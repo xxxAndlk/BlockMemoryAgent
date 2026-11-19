@@ -151,6 +151,11 @@ type reactInternalSession struct {
 	// 注入会话顶层系统提示（免 load_skill 按需取用）并要求优先使用；空=不指定。
 	// atomic.Value 保证跨 goroutine 读写（HTTP 切换即时生效，runSession 起跑重建提示块）。
 	pinnedSkills atomic.Value
+	// logicalTask 是当前逻辑任务合同（Harness 根治 WP1）：存 *team.LogicalTaskContract。
+	// 每轮 runSession/resumeSession/sendMessage 更新；directiveBlock 与工具上下文读它，
+	// 让"当前任务是什么/允许改哪些资源/哪些不变量仍有效"不依赖会被压缩的对话历史。
+	// atomic.Value 保证 HTTP 注入/主循环读取无数据竞争；nil=未绑定（legacy 会话）。
+	logicalTask atomic.Value
 	// activeTopicID 当前活跃话题 ID。切换话题时旧 Agent 树终结 + 新树起,
 	// 旧话题摘要写入 sharedKV `topic:{sessionID}:{topicID}:summary`。空表示单话题(未切换过)。
 	// 话题 ID 也在切换时用于emetries 标签(若需)。
@@ -503,7 +508,7 @@ func (st *reactSessionStore) createSession(goal, workDir string) *reactInternalS
 // waitProjectDoc 有界等待 PROJECT.md 就绪（TODO 第14项 T9）：cluster/daily 等 ≤2s——
 // 项目概览段进入首轮系统提示词即冻结进前缀缓存，首轮就值得等；超时不再等（晚到的
 // 生成结果由 projectRefresher/后续轮刷新，本会话前缀不受影响）。fast 档不等
-//（buildSystemPrompt 对 PROJECT.md 缺失本就略段，秒回优先）。
+// （buildSystemPrompt 对 PROJECT.md 缺失本就略段，秒回优先）。
 // 信号为 nil（恢复会话/测试直建）直接返回。
 func waitProjectDoc(session *reactInternalSession, timeout time.Duration) {
 	if session.projectDocReady == nil {
@@ -1056,8 +1061,8 @@ func sessionMetaMemory(session *reactInternalSession) []map[string]any {
 }
 
 // gearFromMetaMemory 从持久化 meta 读取档位（TODO #14）：取首个合法枚举值
-//（历史 "auto" 经 NormalizeGear 映射为 daily）；缺键/非法值/无 meta 回落 fallback
-//（store 默认档）。
+// （历史 "auto" 经 NormalizeGear 映射为 daily）；缺键/非法值/无 meta 回落 fallback
+// （store 默认档）。
 func gearFromMetaMemory(meta []map[string]any, fallback string) string {
 	for _, m := range meta {
 		if m == nil {

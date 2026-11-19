@@ -27,6 +27,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/internal/skill"
 	"github.com/blockmemory/agent/backend/internal/store"
+	"github.com/blockmemory/agent/backend/internal/team"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 	pkgconfig "github.com/blockmemory/agent/backend/pkg/config"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -77,6 +78,10 @@ type ReactService struct {
 	// directiveHook 指令模式钩子（goal/loop，2026-10-18）：回合成功结束评估续跑、
 	// 用户停止时同步停用。nil（默认）时 goal/loop 零行为；bootstrap 注入 goal.Manager。
 	directiveHook DirectiveHook
+
+	// taskManager 逻辑任务管理器（Harness 根治 WP1，2026-11-18）：创建/修订当前任务合同、
+	// 维护不变量与验收规则。nil 或 mode=off 时零行为（灰度回退开关）。
+	taskManager *team.TaskManager
 
 	// pendingChecker 注入到每个 ReActAgent，用于父会话终结保护
 	// （有未决子 Agent 时阻止终结，防止迟到 mailbox 消息丢失）。
@@ -1015,16 +1020,20 @@ func (s *ReactService) longTermMemoryBlock(workDir string) string {
 
 // sessionDirectiveBlock 把实时决策账本与长期记忆放在同一尾部注入位。
 func (s *ReactService) sessionDirectiveBlock(session *reactInternalSession) string {
-	decision := strings.TrimSpace(s.decisionBlock(session))
-	memory := strings.TrimSpace(s.longTermMemoryBlock(session.currentWorkDir()))
-	switch {
-	case decision == "":
-		return memory
-	case memory == "":
-		return decision
-	default:
-		return decision + "\n\n" + memory
+	// 逻辑任务合同（Harness 根治 WP1，2026-11-18）：与决策账本同槽位（请求尾部 system 块），
+	// 不进压缩段、不被 windowMessages 裁掉——I-STATE-1「当前合同与活跃不变量永不参与
+	// 有损摘要」。只注入当前 revision 的合同与 active 不变量，历史/撤销项不注入。
+	parts := make([]string, 0, 3)
+	for _, blk := range []string{
+		strings.TrimSpace(s.logicalTaskBlock(session)),
+		strings.TrimSpace(s.decisionBlock(session)),
+		strings.TrimSpace(s.longTermMemoryBlock(session.currentWorkDir())),
+	} {
+		if blk != "" {
+			parts = append(parts, blk)
+		}
 	}
+	return strings.Join(parts, "\n\n")
 }
 
 // 历史：metaPersonaLite（续轮仅 soul 的轻量注入器，TODO 第八项 P0-2 省 ~4K runes/呼）
@@ -1069,6 +1078,8 @@ type ReactRuntimeConfig struct {
 	ToolParallelEnabled *bool
 	// ToolParallelMaxConcurrency 并行工具并发上限；<=0 按默认 4。
 	ToolParallelMaxConcurrency int
+	// LogicalTaskContractMaxRunes 逻辑任务合同块注入上限（Harness 根治 WP1）；<=0 按默认 2200。
+	LogicalTaskContractMaxRunes int
 }
 
 // SetRuntimeConfig 注入 ReAct 主循环运行时参数（见 ReactRuntimeConfig）。
@@ -2203,6 +2214,25 @@ func (s *ReactService) Control(ctx context.Context, sessionID string, cmd Contro
 			return fmt.Errorf("%w: work_dir 参数缺失或类型不符", ErrInvalidSessionState)
 		}
 		return s.SetSessionWorkDir(ctx, sessionID, dir)
+	case ControlOpAcceptResult:
+		// 用户显式接受本次逻辑任务结果（Harness 根治 WP6）：verified/delivered-unverified
+		// → accepted，并落 System 事件留痕。这是 Evolver 正面学习的唯一闸门依据
+		// （I-LEARN-1），因此必须在 accepted 之后才允许沉淀经验。
+		task, err := s.AcceptResult(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		s.store.mu.RLock()
+		session := s.store.sessions[sessionID]
+		s.store.mu.RUnlock()
+		if session != nil {
+			s.store.addEvent(session, eventkind.System, "System",
+				fmt.Sprintf("用户已接受逻辑任务结果：id=%s rev=%d hash=%s",
+					task.LogicalTaskID, task.Revision, shortContentHash(task.ContentHash)),
+				"", "", "", "", "", true)
+			s.attachLogicalTask(session, task)
+		}
+		return nil
 	case ControlOpWorktree:
 		// worktree 合并门操作（TODO 第9⑤/#10⑤）：merge 走合并门，reject 驳回回信。
 		action, _ := cmd.Args["action"].(string)
@@ -4380,6 +4410,11 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	// 模型仍能从账本看到"最初目标 + 当前路线 + 已废止路线"。
 	s.hydrateDecisions(runCtx, session)
 	s.recordDecision(runCtx, session, store.DecisionKindDirective, session.Goal, "goal")
+	// 逻辑任务合同（Harness 根治 WP1 §5.3）：首跑创建根任务；enforce 下注入上下文与工具
+	// 授权，shadow 下只观测。必须在 agent.Run 之前完成，否则本轮工具调用仍无合同可依。
+	if task := s.ensureLogicalTask(runCtx, session, session.Goal, "goal", wd); task != nil {
+		runCtx = withLogicalTaskContext(runCtx, task)
+	}
 	// 长期记忆撤回（2026-10-24）：任务书同样是真实用户原文——"这个项目以后不要单图
 	// warp"这类纠正必须在首轮就落到长期记忆，否则后续每轮仍在注入旧经验。
 	s.applyMemoryRetraction(runCtx, session, session.Goal, "goal")
@@ -4460,6 +4495,11 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	session.EndedAt = &now
 	session.History = result.History
 	s.store.mu.Unlock()
+
+	// 逻辑任务结算（Harness 根治 WP3/WP6）：先把任务推进到终态（通常
+	// delivered-unverified），用户点「接受结果」后才 accepted；Evolver 闸门据此判定。
+	// 必须在 evolveSession 之前，否则闸门看到的是过期的 active 状态。
+	s.settleLogicalTask(session, "success")
 
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
 	// （用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
@@ -4623,6 +4663,12 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 		runCtx = WithUserImages(runCtx, turnImages)
 	}
 
+	// 逻辑任务合同（同 runSession）：续跑/运行中纠正按 §3.3 规则 refine 或新建任务。
+	// 用户纠正立即使旧 revision 对后续 Action 失效（新 revision 覆盖 ctx 中的合同）。
+	if task := s.ensureLogicalTask(runCtx, session, input, "user_message", wd); task != nil {
+		runCtx = withLogicalTaskContext(runCtx, task)
+	}
+
 	// 召回旧话题摘要拼到本轮输入前(切换话题后续接上下文);同一话题只注入一次。
 	// 用注入会话 workDir 后的 runCtx(同 runSession):话题摘要 KV 按会话目录解析。
 	// acceptGoal 保留注入前的原始用户输入，供终答验收闭环作任务目标（不掺召回/技能前缀）。
@@ -4701,6 +4747,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	session.EndedAt = &now
 	session.History = result.History
 	s.store.mu.Unlock()
+
+	// 逻辑任务结算（Harness 根治 WP3/WP6）：先把任务推进到终态（通常
+	// delivered-unverified），用户点「接受结果」后才 accepted；Evolver 闸门据此判定。
+	// 必须在 evolveSession 之前，否则闸门看到的是过期的 active 状态。
+	s.settleLogicalTask(session, "success")
 
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
 	// （用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
@@ -5255,6 +5306,10 @@ func (s *ReactService) setSessionError(session *reactInternalSession, msg string
 
 	// 添加错误事件。
 	s.store.addEvent(session, eventkind.Error, "System", msg, "", "", "", "", "", false)
+
+	// 逻辑任务结算（同成功路径）：失败/取消的任务不得留在 active，也绝不直接 accepted
+	//（需显式重新激活后重跑，2026-11-19 验收 P0-4）。
+	s.settleLogicalTask(session, "failed")
 
 	// 会话进化（设计 §6.1 失败会话参与进化，踩坑经验价值更高）：
 	// 用户主动取消（context canceled）不进化。

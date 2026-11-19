@@ -719,6 +719,29 @@ func (m *SessionManager) HandleSessionModel(c *gin.Context) {
 	})
 }
 
+// HandleSessionAcceptResult 处理 POST /api/sessions/{id}/accept（Harness 根治 WP6）。
+//
+// 职责：用户显式接受本次逻辑任务结果（verified/delivered-unverified → accepted）。
+// 这是唯一的"用户已接受"事实来源：Evolver 只在 accepted 之后才允许产生正面技能与
+// 长期记忆晋升（I-LEARN-1），机器验证（verified）不等于用户接受。
+//
+// 未启用逻辑任务（agent.logical_task_mode=off）或无任务时返回 400；
+// 终态不可接受（accepted/superseded）同样 400，由 agent 层状态机拒绝。
+func (m *SessionManager) HandleSessionAcceptResult(c *gin.Context) {
+	id := c.Param("id")
+	if err := m.agent.Control(c.Request.Context(), id, agent.ControlCommand{
+		Op: agent.ControlOpAcceptResult,
+	}); err != nil {
+		msg, status := agentErrorStatus(err)
+		c.String(status, "%s", msg)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{
+		"session_id": id,
+		"status":     "accepted",
+	})
+}
+
 // HandleSessionThinking 处理 POST /api/sessions/{id}/thinking（2026-09-16 会话级思考强度）。
 // 职责：切换会话思考强度（off|low|medium|high，空串=跟随角色默认），经 Control 通道下发；
 // atomic 即时生效——providerForRole 每次 LLM 调用实时读取，下一次调用即用新档（热，免重启）。

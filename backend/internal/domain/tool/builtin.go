@@ -90,6 +90,30 @@ type (
 		// 修改"的并发覆盖（old_string 基于过期内容时 fuzzy 匹配也可能误换到别处）。
 		// 不传则不校验（现状 advisory 行为不变）。
 		ExpectedMtime string `json:"expected_mtime,omitempty"`
+
+		// --- 语义 PatchPlan（WP4 §8.3，semantic_edit_mode 非 off 时生效） ---
+		// SemanticKind 声明语义目标种类：css_declaration | template_node。
+		// 声明后由语言 worker（AST/CSSOM）定位唯一目标并生成单条最小 TextEdit；
+		// enforce 模式下定位失败即拒绝写入（不回退字面替换），off 模式下忽略。
+		SemanticKind string `json:"semantic_kind,omitempty"`
+		// SemanticSelector 为 CSS 选择器（semantic_kind=css_declaration 时必填）。
+		SemanticSelector string `json:"semantic_selector,omitempty"`
+		// SemanticProperty 为 CSS 属性名（css_declaration 时必填，如 min-width）。
+		SemanticProperty string `json:"semantic_property,omitempty"`
+		// SemanticExpectedValue 为属性当前值（可选指纹：不符则拒绝，防改错版本）。
+		SemanticExpectedValue string `json:"semantic_expected_value,omitempty"`
+		// SemanticTag 为模板标签名（semantic_kind=template_node 时必填）。
+		SemanticTag string `json:"semantic_tag,omitempty"`
+		// SemanticAnchor 为模板锚点文本（与 SemanticText 至少给一个，用于唯一定位）。
+		SemanticAnchor string `json:"semantic_anchor,omitempty"`
+		// SemanticText 为模板节点内必须包含的文本（与 SemanticAnchor 二选一或并用）。
+		SemanticText string `json:"semantic_text,omitempty"`
+		// SemanticNewValue 为语义编辑的替换值（覆盖 new_string）。
+		SemanticNewValue string `json:"semantic_new_value,omitempty"`
+		// SemanticExpectedHash 为目标文件内容 sha256（可选；防"读到的不是要改的那版"）。
+		SemanticExpectedHash string `json:"semantic_expected_hash,omitempty"`
+		// SemanticExpectedMatches 必须为 1（显式声明批量替换会被拒绝）。
+		SemanticExpectedMatches int `json:"semantic_expected_matches,omitempty"`
 	}
 	// restoreFileInput 表示 RestoreFile 工具的输入参数。
 	restoreFileInput struct {
@@ -819,20 +843,59 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 	if path == "" {
 		return &Result{Tool: "EditFile", Error: "path is required"}
 	}
-	if oldStr == "" {
-		return &Result{Tool: "EditFile", Path: path, Error: "old_string is required（要替换的原文片段不能为空）"}
+	// 语义 PatchPlan（WP4 §8.3）：声明了 semantic_kind 且模式非 off 时，old_string 不是
+	// 必需参数——定位由语言 worker 完成（AST/CSSOM 级），字面片段只作为旧路径的兜底。
+	semanticReq, semanticRequested := parseSemanticEditRequest(args)
+	semanticMode := normalizeSemanticEditMode(e.semanticEditConfig().Mode)
+	trustedLiteral := false
+	literalRationale := ""
+	// enforce 硬门（2026-11-19 再次验收 P0-1）：语义编辑模式下不得靠“不声明 semantic_kind”
+	// 退回字面替换——那等于把 AST/CSSOM 定位、唯一性、指纹、最小编辑四项保护全部退绕。
+	//
+	// 唯一例外是**显式声明的受控字面通道**：调用方必须同时给 semantic_literal_rationale
+	// （为何无法做语义定位），该理由会进 Result.Output 并随 ArgsJSON 落入 action_events 底账。
+	// 它仍受合同写范围 + 检查点 + 真实 diff + 越界回滚约束，因此是可审计的，不是静默降级。
+	if semanticMode == SemanticEditEnforce && !semanticRequested {
+		literalRationale = strings.TrimSpace(stringArg(args, "semantic_literal_rationale"))
+		if len([]rune(literalRationale)) < 8 {
+			return &Result{Tool: "EditFile", Path: path, Error: "semantic_edit_mode=enforce：EditFile 必须声明语义目标" +
+				"（semantic_kind=css_declaration|template_node 及对应参数），不得用 old_string/new_string 盲替换。" +
+				"若目标语言/节点确实无法做语义定位，请显式传 semantic_literal_rationale（不少于 8 字）走受控字面通道；" +
+				"整体重写请用 WriteFile。"}
+		}
+		// 受控字面通道也只能做唯一、最小编辑。replace_all 会重新打开“改一个间距却
+		// 改完全部相同声明”的事故路径，模型自述理由不能作为批量替换授权。
+		if replaceAll {
+			return &Result{Tool: "EditFile", Path: path, Error: "semantic_edit_mode=enforce：受控字面通道禁止 replace_all；" +
+				"多个相同目标必须逐一解析并分别确认，不得批量盲替换"}
+		}
+		trustedLiteral = true
 	}
-	if oldStr == newStr {
-		return &Result{Tool: "EditFile", Path: path, Error: "old_string 与 new_string 相同，无需编辑"}
+	useSemantic := semanticRequested && semanticMode != SemanticEditOff
+	if semanticRequested && semanticMode == SemanticEditEnforce && semanticReq.NewValue == "" {
+		return &Result{Tool: "EditFile", Path: path,
+			Error: "semantic_new_value 必填（enforce 下的语义编辑不读 old_string/new_string）"}
 	}
-	if len([]rune(newStr)) > maxEditStringRunes {
-		return &Result{Tool: "EditFile", Path: path, Error: fmt.Sprintf(
-			"new_string too large: %d runes (max %d)。EditFile 是局部替换，替换片段不应超大；"+
-				"改动面接近整文件时请用 WriteFile 整文件重写", len([]rune(newStr)), maxEditStringRunes)}
+	if !useSemantic || semanticMode != SemanticEditEnforce {
+		if oldStr == "" {
+			return &Result{Tool: "EditFile", Path: path, Error: "old_string is required（要替换的原文片段不能为空）"}
+		}
+		if oldStr == newStr {
+			return &Result{Tool: "EditFile", Path: path, Error: "old_string 与 new_string 相同，无需编辑"}
+		}
+		if len([]rune(newStr)) > maxEditStringRunes {
+			return &Result{Tool: "EditFile", Path: path, Error: fmt.Sprintf(
+				"new_string too large: %d runes (max %d)。EditFile 是局部替换，替换片段不应超大；"+
+					"改动面接近整文件时请用 WriteFile 整文件重写", len([]rune(newStr)), maxEditStringRunes)}
+		}
 	}
 
 	// 调用写保护守卫进行策略校验（与 WriteFile 同口径：保护目录/邮箱文件等）。
-	if err := e.guards.CheckWrite(path, newStr, allowSpaces); err != nil {
+	guardPayload := newStr
+	if guardPayload == "" {
+		guardPayload = semanticReq.NewValue
+	}
+	if err := e.guards.CheckWrite(path, guardPayload, allowSpaces); err != nil {
 		return &Result{Tool: "EditFile", Path: path, Error: err.Error()}
 	}
 
@@ -863,6 +926,29 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 				"。EditFile 只能编辑已存在文件；新建文件请用 WriteFile。"}
 		}
 		return &Result{Tool: "EditFile", Path: absPath, Error: "read: " + err.Error()}
+	}
+
+	// 语义 PatchPlan（WP4 §8.3，2026-11-19 验收接线）：调用方声明了 semantic_kind 时，
+	// 先用语言 worker 定位唯一目标并生成单条 TextEdit（AST/CSSOM 级），而不是字面匹配。
+	//
+	//   - enforce：必须拿到唯一语义目标，worker 不可用/目标歧义/指纹过期一律 fail closed；
+	//   - shadow ：仍走旧字面替换，但额外跑一遍 worker 并在结果尾部附"语义定位结果"；
+	//   - off    ：完全不介入（默认，与改造前逐字节一致）。
+	semanticShadowNote := ""
+	if useSemantic {
+		semOut, semNote, semErr := e.semanticEditReplace(ctx, absPath, path, data, semanticReq, semanticMode)
+		if semErr != nil {
+			if semanticMode == SemanticEditEnforce {
+				return &Result{Tool: "EditFile", Path: absPath,
+					Error: "语义编辑失败（enforce 下不回退字面替换）：" + semErr.Error()}
+			}
+			// shadow：记录偏差，继续走旧路径（不改变写入内容）。
+			semanticShadowNote = "；语义定位（shadow）失败：" + semErr.Error()
+		} else if semOut != nil {
+			return semOut
+		} else if semNote != "" {
+			semanticShadowNote = semNote
+		}
 	}
 
 	// 匹配：两侧行尾统一为 \n 再计数（\r\n 与 \n 等价），缩进/空格必须逐字符一致。
@@ -931,7 +1017,7 @@ func (e *Executor) editFile(ctx context.Context, args map[string]any) *Result {
 	result := &Result{
 		Tool:    "EditFile",
 		Success: true,
-		Output:  fmt.Sprintf("replaced %d occurrence(s) at line %d (%d -> %d bytes)%s", count, line, len(data), len(newContent), fuzzyWarn),
+		Output:  fmt.Sprintf("replaced %d occurrence(s) at line %d (%d -> %d bytes)%s%s%s", count, line, len(data), len(newContent), fuzzyWarn, semanticShadowNote, literalNote(trustedLiteral, literalRationale)),
 		Path:    absPath,
 	}
 	if snapPath != "" {

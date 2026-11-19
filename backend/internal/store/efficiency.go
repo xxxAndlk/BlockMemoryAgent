@@ -32,9 +32,9 @@ type RoleEfficiencyStats struct {
 
 // AgentEventStats 按实例聚合的事件统计（agent_events.agent_id = 实例 ID）。
 type AgentEventStats struct {
-	AgentID     string   // 实例 ID（树节点 ID）
-	ToolCalls   int      // tool_call 事件数（≈ 轮次-1，每轮至多一次工具批次）
-	Answers     int      // answer 事件数（终答，正常 1）
+	AgentID      string   // 实例 ID（树节点 ID）
+	ToolCalls    int      // tool_call 事件数（≈ 轮次-1，每轮至多一次工具批次）
+	Answers      int      // answer 事件数（终答，正常 1）
 	WrittenFiles []string // WriteFile/EditFile 去重交付路径（Go 侧解析，保序）
 }
 

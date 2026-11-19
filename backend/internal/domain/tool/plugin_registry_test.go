@@ -23,7 +23,7 @@ func (f *fakePluginTool) Aliases() []string { return []string{"alias_" + f.name}
 func (f *fakePluginTool) Execute(ctx context.Context, args map[string]any) *Result {
 	return &Result{Tool: f.name, Success: true, Output: "plugin-ok:" + f.name}
 }
-func (f *fakePluginTool) Description() string            { return "插件测试工具 " + f.name }
+func (f *fakePluginTool) Description() string             { return "插件测试工具 " + f.name }
 func (f *fakePluginTool) InputSchema() *jsonschema.Schema { return nil }
 func (f *fakePluginTool) Destructive() bool               { return f.name == "danger" }
 

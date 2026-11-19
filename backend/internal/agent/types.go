@@ -284,6 +284,11 @@ const (
 	// Args{"skills": []string}，空数组=清空（合法）。atomic 即时生效——下一轮起跑按
 	// 新集合重建技能提示块（全文直载）；新增的 learned 技能提升使用权重。
 	ControlOpPinnedSkills = "pinned-skills"
+	// ControlOpAcceptResult 用户显式接受本次逻辑任务结果（Harness 根治 WP6，2026-11-18）：
+	// verified/delivered-unverified → accepted。这是唯一的"用户已接受"事实来源——
+	// Evolver 只在 accepted 后允许正面学习（I-LEARN-1：未验证/被纠正的任务不得产生
+	// 正面技能或长期记忆晋升）。Args 空；未启用逻辑任务（mode=off）时返回错误。
+	ControlOpAcceptResult = "accept-result"
 )
 
 // Filter 表示列出会话时使用的筛选条件。

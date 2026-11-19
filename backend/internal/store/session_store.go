@@ -199,7 +199,7 @@ func (s *SessionStore) GetEvents(ctx context.Context, sessionID string) ([]Sessi
 
 // sessionScopedTables 列出全部带 session_id 列的会话从属表，会话硬删除逐表清扫。
 // agent_events/agent_messages/agent_compress_states 的 session_id 由 agentID 派生
-//（MetaAgent agentID==sessionID；子 Agent "session-N/role-K" 取首段），DELETE 按
+// （MetaAgent agentID==sessionID；子 Agent "session-N/role-K" 取首段），DELETE 按
 // session_id 等价即可覆盖该会话的全部子 Agent 行。
 var sessionScopedTables = []string{
 	"session_history",
@@ -215,7 +215,12 @@ var sessionScopedTables = []string{
 	"session_directive", // goal/loop 指令模式（2026-10-18，goal.Manager 懒建表）
 	"goal_reminders",    // schedule_followup 到期回查（2026-10-18，goal.Manager 懒建表）
 	"flow_runs",         // 可视化编排运行（2026-10-18）；其 node_runs 经 run_id 从属，见 DeleteSessionData 前置删除
-	"workflow_runs", // 工作流量产运行（2026-10-16）；其 units 经 run_id 从属，见 DeleteSessionData 前置删除
+	"workflow_runs",     // 工作流量产运行（2026-10-16）；其 units 经 run_id 从属，见 DeleteSessionData 前置删除
+	// Harness 根治（2026-11-18）三表：用户显式删会话时纳入既有的级联清扫清单
+	//（计划 §3.5 要求：新表全部有 owner + 会话删除时纳入既有清理）。
+	"logical_tasks",       // 逻辑任务当前投影
+	"logical_task_events", // 逻辑任务 append-only 事件
+	"action_events",       // Action 阶段事件底账
 }
 
 // tableExistsTx 判断表是否存在（to_regclass 对不存在的表返回 NULL）。

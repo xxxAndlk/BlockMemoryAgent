@@ -11,7 +11,7 @@ package agent
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"image"
@@ -152,7 +152,7 @@ func boxFilter(src image.Image, dw, dh int) *image.RGBA {
 	return dst
 }
 
-// saveOriginalImage 把原图写入 <workDir>/.bma/images/<unix>-<sha1前8>.<ext>，返回绝对路径。
+// saveOriginalImage 把原图写入 <workDir>/.bma/images/<unix>-<sha256前8>.<ext>，返回绝对路径。
 // 文件名带内容摘要：同图多次落盘幂等可追溯，异图不覆盖。
 func saveOriginalImage(workDir string, raw []byte, format string) (string, error) {
 	ext := ".png"
@@ -163,7 +163,7 @@ func saveOriginalImage(workDir string, raw []byte, format string) (string, error
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	sum := fmt.Sprintf("%x", sha1.Sum(raw))[:8]
+	sum := fmt.Sprintf("%x", sha256.Sum256(raw))[:8]
 	path := filepath.Join(dir, fmt.Sprintf("%d-%s%s", time.Now().Unix(), sum, ext))
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		return "", err

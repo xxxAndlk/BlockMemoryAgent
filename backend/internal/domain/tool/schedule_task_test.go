@@ -27,8 +27,8 @@ func TestScheduleTask_Validation(t *testing.T) {
 		return "ok", nil
 	}}
 	for _, args := range []map[string]any{
-		{"goal": "y"},            // 缺 name
-		{"name": "x"},            // 缺 goal
+		{"goal": "y"},               // 缺 name
+		{"name": "x"},               // 缺 goal
 		{"name": "  ", "goal": "y"}, // 空白 name
 	} {
 		res := tl.Execute(context.Background(), args)

@@ -34,6 +34,7 @@ go.work.sum
 /workspace
 /zzzdemo
 /.bma
+# /test 整体忽略会把 Harness 回归证据一起丢掉：目录仍忽略，仅显式反忽略验收用例。
 /test
 /.claude
 /.tui-driver

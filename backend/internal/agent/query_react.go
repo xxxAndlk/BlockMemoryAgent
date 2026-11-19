@@ -184,11 +184,11 @@ func (s *ReactService) metricsQueryResult(ctx context.Context, sessionID string)
 		avg = (totalDur / time.Duration(calls)).Round(time.Millisecond).String()
 	}
 	return Result{Data: map[string]any{
-		"session_id":            sessionID,
-		"calls":                 calls,
-		"timeouts":              timeouts,
-		"avg_duration":          avg,
-		"max_duration":          maxDur.Round(time.Millisecond).String(),
+		"session_id":             sessionID,
+		"calls":                  calls,
+		"timeouts":               timeouts,
+		"avg_duration":           avg,
+		"max_duration":           maxDur.Round(time.Millisecond).String(),
 		"input_tokens":           inTok,
 		"output_tokens":          outTok,
 		"total_tokens":           inTok + outTok,
@@ -329,11 +329,11 @@ type efficiencyBranchWire struct {
 
 // efficiencyRoleWire 角色级 token/延迟统计行（HTTP 线型）。
 type efficiencyRoleWire struct {
-	Role           string `json:"role"`
-	Calls          int    `json:"calls"`
-	InputTokens    int64  `json:"input_tokens"`
-	OutputTokens   int64  `json:"output_tokens"`
-	AvgLatencyMs   int64  `json:"avg_latency_ms"`
+	Role           string  `json:"role"`
+	Calls          int     `json:"calls"`
+	InputTokens    int64   `json:"input_tokens"`
+	OutputTokens   int64   `json:"output_tokens"`
+	AvgLatencyMs   int64   `json:"avg_latency_ms"`
 	P50InputTokens float64 `json:"p50_input_tokens"`
 	P95InputTokens float64 `json:"p95_input_tokens"`
 }
@@ -445,24 +445,24 @@ func (s *ReactService) efficiencyQueryResult(ctx context.Context, sessionID stri
 		roleStats = append(roleStats, efficiencyRoleWire{
 			Role: r.Agent, Calls: r.Calls,
 			InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
-			AvgLatencyMs: r.AvgLatency.Milliseconds(),
+			AvgLatencyMs:   r.AvgLatency.Milliseconds(),
 			P50InputTokens: r.P50InputTokens, P95InputTokens: r.P95InputTokens,
 		})
 	}
 
 	return Result{Data: map[string]any{
-		"session_id":           sessionID,
-		"tokens_per_file":      costPerFile,
-		"files_delivered":      filesDelivered,
+		"session_id":              sessionID,
+		"tokens_per_file":         costPerFile,
+		"files_delivered":         filesDelivered,
 		"avg_rounds_per_dispatch": avgRounds,
-		"verify_token_share":   verifyShare,
-		"meta_domain_ratio":    metaDomainRatio,
-		"input_p50":            p50,
-		"input_p95":            p95,
-		"total_input_tokens":   totalIn,
-		"total_output_tokens":  totalOut,
-		"branches":             branches,
-		"role_stats":           roleStats,
+		"verify_token_share":      verifyShare,
+		"meta_domain_ratio":       metaDomainRatio,
+		"input_p50":               p50,
+		"input_p95":               p95,
+		"total_input_tokens":      totalIn,
+		"total_output_tokens":     totalOut,
+		"branches":                branches,
+		"role_stats":              roleStats,
 	}}
 }
 

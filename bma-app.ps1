@@ -246,7 +246,10 @@ function Build-RuntimePayload {
     if (-not (Test-RuntimeAvailable $Repo)) { throw "缺少运行时源包（$cache 下需要 pg16.zip / pgvector-pg16.zip / redis-win.zip），先跑 installer\fetch-runtime.ps1" }
     $prepared = Join-Path $cache 'prepared'
     # 配方版本：载荷**组成**变了就重建（否则会复用旧缓存，缺新加的 node/媒体桥）。
-    $recipe = 'v6-node-media-playwright-cu-headless'
+    # 配方号含 semantic-worker：载荷里多了一套 Node 语义编辑 worker（worker.mjs +
+    # 固定版本依赖 node_modules），加它就等于改组成 —— 必须重建缓存，否则旧缓存
+    # 会被复用、包里没有 worker（enforce 下 EditFile 全 fail closed）。
+    $recipe = 'v7-node-media-playwright-cu-headless-semantic'
     $recipeFile = Join-Path $prepared '.recipe'
     $recipeMatch = ((Test-Path $recipeFile) -and ((Get-Content $recipeFile -Raw).Trim() -eq $recipe))
     # 配方**明确**不匹配：组成可能整体不同，清空重建（全本地源包/缓存，代价可控）。
@@ -427,6 +430,28 @@ function Build-RuntimePayload {
                 dependencies = [ordered]@{ '@zavora-ai/computer-use-mcp' = $computerUseMcpVersion }
             })
         Invoke-NpmInstall -Dir $cuOut -What '@zavora-ai/computer-use-mcp' -Repo $Repo
+    }
+
+    # 语义编辑 worker（WP4）：随包 Node 跑，enforce 下 EditFile 靠它做 AST/CSSOM 定位。
+    # 必须在 Node 之后、烘焙载荷之前铺 —— 缺它时 enforce 会把每次编辑都 fail closed，
+    # 桌面版就等于没有语义编辑（验收报告 §6.2 指出的就是这一点）。
+    $semSrc = Join-Path $Repo 'tools\semantic-edit'
+    if (Test-Path (Join-Path $semSrc 'worker.mjs')) {
+        $semOut = Join-Path $prepared 'media\semantic-edit'
+        New-Item -ItemType Directory -Force -Path $semOut | Out-Null
+        foreach ($f in @('worker.mjs', 'package.json', 'package-lock.json', 'README.md')) {
+            $s = Join-Path $semSrc $f
+            if (Test-Path $s) { Copy-Item -Force $s $semOut }
+        }
+        # 依赖判定靠入口包的实际文件（与其它桥同一纪律：入口存在才算装好）。
+        if (-not (Test-Path (Join-Path $semOut 'node_modules\@vue\compiler-sfc\package.json'))) {
+            Write-Log '[runtime] 安装语义编辑 worker 依赖（npm install，一次）...'
+            Invoke-NpmInstall -Dir $semOut -What 'semantic-edit worker 依赖' -Repo $Repo
+        } else {
+            Write-Log '[runtime] 复用语义编辑 worker 依赖'
+        }
+    } else {
+        Write-Log '[runtime] warn: 未找到 tools\semantic-edit\worker.mjs（桌面版 semantic_edit_mode 只能留 off）'
     }
 
     # 铺到包目录（prepared 保留作缓存，下次打包直接复制）
@@ -857,23 +882,12 @@ function Invoke-Pack {
         if (Test-Path $p) { Remove-Item -Recurse -Force $p; Write-Log "[pack] 已剔除禁运文件 $f" }
     }
 
-    # 模型注册表模板：models.json 在禁运清单里（用户注册表可能含明文 Key），但新装
-    # 机器没有它就没有任何可用模型 —— 生成一份"只含 ${VAR} 引用"的模板随包走。
-    $modelsSrc = Join-Path $repo 'config\models.json'
-    if (Test-Path $modelsSrc) {
-        try {
-            $mj = Get-Content $modelsSrc -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($m in $mj.models) {
-                if ($m.api_key -and -not ($m.api_key -match '\$\{')) { $m.api_key = '${ANTHROPIC_API_KEY}' }
-                if ($m.base_url -and -not ($m.base_url -match '\$\{')) { $m.base_url = '${ANTHROPIC_BASE_URL}' }
-            }
-            $jsonText = $mj | ConvertTo-Json -Depth 8
-            [System.IO.File]::WriteAllText((Join-Path $stage 'config-templates\models.json'), $jsonText, (New-Object System.Text.UTF8Encoding($false)))
-            Write-Log '[pack] 已生成模型注册表模板（去密钥，仅 ${VAR} 引用）'
-        } catch {
-            Write-Log '[pack] warn: 生成模型注册表模板失败（新装机器将没有可用模型）'
-        }
-    }
+    # 模型注册表模板（2026-11-18 改）：新装机一律给**空注册表** {"models": []}，
+    # 由用户在应用内模型页手动新增自己的模型；不再从仓库 models.json 复制“去密钥副本”
+    #（那会把开发机的火山/方舟模型清单默认铺给所有人，用户不想要这些模型）。
+    [System.IO.File]::WriteAllText((Join-Path $stage 'config-templates\models.json'),
+        "{`n  `"models`": []`n}`n", (New-Object System.Text.UTF8Encoding($false)))
+    Write-Log '[pack] 模型注册表模板：空清单（首次在模型页手动新增）'
 
     # 密钥扫描：模板里只允许 ${VAR} 插值，发现疑似真实 key 一律拒包。
     # 扫描面 = 我们自己的配置/脚本（config-templates、启动器等），跳过 runtime\
@@ -1223,8 +1237,15 @@ function Get-StartMenuDirs {
         } catch { }
     }
     try { & $add ([Environment]::GetFolderPath('Programs')) } catch { }
-    if ($env:APPDATA) { & $add (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') }
-    if ($env:ProgramData) { & $add (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') }
+    if ($env:APPDATA) { try { & $add (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') } catch { } }
+    # 全用户开始菜单只有管理员能写：非提权时**不加候选**，否则每次装都刷一条 × 权限噪音
+    # （per-user 安装靠自己的 Programs 目录就够，开始菜单搜索同样能找到）。
+    $isAdmin = $false
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $isAdmin = (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { }
+    if ($isAdmin -and $env:ProgramData) { try { & $add (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') } catch { } }
     return $cands
 }
 
@@ -1413,7 +1434,13 @@ function Invoke-Install {
             foreach ($f in Get-ChildItem $tplDir -File) {
                 if ($f.Name -eq 'env.example') { continue }
                 $out = Join-Path (Join-Path $Target 'config') $f.Name
-                if (-not (Test-Path $out)) {
+                # 0 字节也算缺失：老安装出现过空 models.json 占位文件，空 JSON 会让注册表
+                # 加载失败（模型页新增模型报“模型注册表未启用”）。
+                $needSeed = -not (Test-Path -LiteralPath $out)
+                if (-not $needSeed) {
+                    try { $needSeed = ((Get-Item -LiteralPath $out).Length -eq 0) } catch { }
+                }
+                if ($needSeed) {
                     Copy-Item -Force $f.FullName $out
                     $seeded += ('config\' + $f.Name)
                 }

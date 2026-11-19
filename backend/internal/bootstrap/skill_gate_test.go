@@ -240,7 +240,7 @@ func TestPersistQualityGateRejected(t *testing.T) {
 		return skillScoreResult{Score: 2, Reason: "空泛不可执行"}, nil
 	}
 	sk := agent.EvolvedSkill{Name: "vague-skill", Title: "空泛技能", WhenToUse: "任何时候",
-		Steps: []string{"运行 pytest -q 验证行为", "运行 mypy src/ --strict 检查类型", "运行 ruff check . 扫一遍 lint"},
+		Steps:  []string{"运行 pytest -q 验证行为", "运行 mypy src/ --strict 检查类型", "运行 ruff check . 扫一遍 lint"},
 		Verify: "三个命令退出码均为 0"}
 	if err := s.persist(context.Background(), "sess-1", []agent.EvolvedSkill{sk}, "success"); err != nil {
 		t.Fatalf("persist: %v", err)
@@ -263,7 +263,7 @@ func TestPersistQualityGatePass(t *testing.T) {
 		return skillScoreResult{Score: 4, Reason: "具体可复用"}, nil
 	}
 	sk := agent.EvolvedSkill{Name: "solid-skill", Title: "具体技能", WhenToUse: "批量重命名时",
-		Steps: []string{"运行 ls *.txt 确认待处理文件清单", "运行 rename 's/foo/bar/' *.txt 批量替换前缀", "运行 ls *.txt 复核新文件名符合预期"},
+		Steps:  []string{"运行 ls *.txt 确认待处理文件清单", "运行 rename 's/foo/bar/' *.txt 批量替换前缀", "运行 ls *.txt 复核新文件名符合预期"},
 		Verify: "ls 输出全部以 bar- 开头"}
 	if err := s.persist(context.Background(), "sess-1", []agent.EvolvedSkill{sk}, "success"); err != nil {
 		t.Fatalf("persist: %v", err)
@@ -283,7 +283,7 @@ func TestPersistQualityGateScoreFailOpen(t *testing.T) {
 		return skillScoreResult{}, errors.New("llm unreachable")
 	}
 	sk := agent.EvolvedSkill{Name: "degrade-skill", Title: "降级技能", WhenToUse: "x 时",
-		Steps: []string{"运行 curl -s localhost:8080/health 探测服务", "运行 docker ps 确认容器在运行", "运行 tail -50 app.log 查最新报错"},
+		Steps:  []string{"运行 curl -s localhost:8080/health 探测服务", "运行 docker ps 确认容器在运行", "运行 tail -50 app.log 查最新报错"},
 		Verify: "health 返回 ok"}
 	if err := s.persist(context.Background(), "sess-1", []agent.EvolvedSkill{sk}, "success"); err != nil {
 		t.Fatalf("persist: %v", err)

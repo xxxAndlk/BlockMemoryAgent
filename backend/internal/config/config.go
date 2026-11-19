@@ -318,6 +318,37 @@ type FeatureTogglesConfig struct {
 	//   enforce  required 超预算/未决/被 fork 丢弃时拒派。
 	ContextManifestMode string `yaml:"context_manifest_mode"`
 
+	// --- Harness 根治开关（doc/计划_Harness合同事务与语义编辑根治.md §5.4）---
+	//
+	// 四组开关各自独立、各自可回退；默认只观察，禁止直接把存量会话切 enforce。
+	// 非法值一律回落最保守档并告警（见 applyHarnessModeDefaults），测试同时锁默认值与非法值。
+
+	// LogicalTaskMode 逻辑任务合同模式（WP1）：
+	//   off      完全不创建/注入合同（零行为变化）；
+	//   shadow   创建合同、记录任务划分与继承观测，但不注入上下文、不授权写入（默认）；
+	//   enforce  合同参与上下文注入与 Action 授权（WP2 enforce 的前置）。
+	LogicalTaskMode string `yaml:"logical_task_mode"`
+	// ActionTransactionMode Action 事务模式（WP2）：off|shadow|enforce。
+	// shadow 只记录"将会拒绝/回滚"的内容，enforce 才阻断。
+	ActionTransactionMode string `yaml:"action_transaction_mode"`
+	// SemanticEditMode 语义 PatchPlan 模式（WP4）：off|shadow|enforce。
+	// enforce 下语义编辑 worker 不可用时 fail closed（不得静默回退正则盲写）。
+	SemanticEditMode string `yaml:"semantic_edit_mode"`
+	// ContractVerificationMode 合同验收模式（WP5）：off|shadow|enforce。
+	// shadow 只记录 L0/L1 判定结果；enforce 下必需证据缺失只能交付 unverified。
+	ContractVerificationMode string `yaml:"contract_verification_mode"`
+	// CheckpointDir Shadow Git 检查点根目录（WP2）。空=按 BMA 数据目录下的
+	// checkpoints/ 解析（不写用户 .git、不写用户工作区）。
+	CheckpointDir string `yaml:"checkpoint_dir"`
+	// CheckpointMaxFiles 单次快照文件数上限（WP2 性能护栏，0=默认 20000）。
+	// 超限时不删除安全步骤，而是暂停强制上线并记录原因（计划 §6.4）。
+	CheckpointMaxFiles int `yaml:"checkpoint_max_files"`
+	// LogicalTaskContractMaxRunes 合同块注入上限（rune，0=默认 2200）。
+	LogicalTaskContractMaxRunes int `yaml:"logical_task_contract_max_runes"`
+	// SemanticWorkerPath 语义编辑 worker 入口脚本路径（WP4，node + stdio JSON-RPC）。
+	// 空=未配置：semantic_edit_mode=enforce 时 fail closed；shadow 下只记录缺失。
+	SemanticWorkerPath string `yaml:"semantic_worker_path"`
+
 	// VerifyLLMOnStartup 启动期是否对每个模型角色发起一次最小化真实调用做连通性探测。
 	// 默认 false（2026-10-28 起）：模型是可替换运行时依赖，单个模型不可用不阻断启动，
 	// 用户可在应用内模型页随时切换到其他模型；开启时也只告警不阻断（排障用）。
@@ -1113,6 +1144,8 @@ func (c *Config) applyFeatureTogglesDefaults() {
 		log.Printf("[config] illegal context_manifest_mode %q, fallback shadow", c.Agent.ContextManifestMode)
 		c.Agent.ContextManifestMode = "shadow"
 	}
+	// Harness 根治开关（计划 §5.4）：默认只观察，非法值回落最保守档并告警。
+	c.applyHarnessModeDefaults()
 	// 决策层（TODO #23）：影子默认开（影子先行是本层立身原则）；超时默认 5s
 	// （provider 故障/超时 fail-open 回退现状行为，不阻塞链路）。
 	if c.Agent.DecisionShadowEnabled == nil {

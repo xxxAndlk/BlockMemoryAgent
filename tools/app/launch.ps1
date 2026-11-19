@@ -152,6 +152,9 @@ $runLines = @(
     ('set "BMA_UI_PREVIEW_MCP=' + (Join-Path $Root 'runtime\media\ui-preview-mcp\node_modules\@playwright\mcp\cli.js') + '"'),
     ('set "BMA_COMPUTER_USE_MCP=' + (Join-Path $Root 'runtime\media\computer-use-mcp\node_modules\@zavora-ai\computer-use-mcp\dist\launch.js') + '"'),
     ('set "BMA_PLAYWRIGHT_BROWSERS=' + (Join-Path $Root 'runtime\media\playwright-browsers') + '"'),
+    # 语义编辑 worker（WP4）：随包 Node + 包内依赖。漏了它 = 桌面版 enforce 下
+    # 每次 EditFile 都 fail closed（验收报告 §6.2 指出的就是这一点）。
+    ('set "BMA_SEMANTIC_EDIT_WORKER=' + (Join-Path $Root 'runtime\media\semantic-edit\worker.mjs') + '"'),
     ('cd /d "' + $Root + '"'),
     ('"' + $exe + '" -web-dist "' + $webDist + '" 1>>"' + $outLog + '" 2>>"' + $errLog + '"')
 )

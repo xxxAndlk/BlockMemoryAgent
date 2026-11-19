@@ -47,7 +47,7 @@ func (mockAgentForRouter) ListAgents(context.Context, string) ([]agent.AgentInst
 func (mockAgentForRouter) Tree(context.Context, string) ([]orchestrator.Node, error) {
 	return nil, nil
 }
-func (mockAgentForRouter) CancelAgent(context.Context, string, string) error { return nil }
+func (mockAgentForRouter) CancelAgent(context.Context, string, string) error      { return nil }
 func (mockAgentForRouter) PauseAgent(context.Context, string, string, bool) error { return nil }
 func (mockAgentForRouter) MessageAgent(context.Context, string, string, string) (bool, error) {
 	return false, nil
@@ -63,7 +63,7 @@ func (mockAgentForRouter) ProjectPreferences(context.Context) (*userprofile.Prof
 	return &userprofile.Profile{}, nil
 }
 func (mockAgentForRouter) SaveProjectPreferences(context.Context, string) error { return nil }
-func (mockAgentForRouter) Shutdown(context.Context) error            { return nil }
+func (mockAgentForRouter) Shutdown(context.Context) error                       { return nil }
 func (mockAgentForRouter) SummarizeTaskTitle(context.Context, string) string {
 	return ""
 }

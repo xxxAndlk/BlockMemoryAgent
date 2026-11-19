@@ -20,6 +20,7 @@ import (
 
 	"github.com/blockmemory/agent/backend/internal/domain/tool"
 	"github.com/blockmemory/agent/backend/internal/logger"
+	"github.com/blockmemory/agent/backend/internal/server/eventkind"
 	"github.com/blockmemory/agent/backend/internal/store"
 	"github.com/blockmemory/agent/backend/internal/userprofile"
 	"github.com/blockmemory/agent/backend/pkg/enums"
@@ -65,9 +66,9 @@ type EvolvedSkill struct {
 
 // EvolveOutput 一次会话进化的三类沉淀（设计 §3）。
 type EvolveOutput struct {
-	UserPrefs      []string // ① 用户偏好增量（全局 user_profile.md，Merge 整理）
-	ProjectLessons []string // ② 项目经验增量（per workDir project_preferences.md ## 项目经验）
-	Rejected       []string // ②b 本会话被用户否决/作废的方案或约定（作废判据，Merge 时撤回矛盾旧行）
+	UserPrefs      []string       // ① 用户偏好增量（全局 user_profile.md，Merge 整理）
+	ProjectLessons []string       // ② 项目经验增量（per workDir project_preferences.md ## 项目经验）
+	Rejected       []string       // ②b 本会话被用户否决/作废的方案或约定（作废判据，Merge 时撤回矛盾旧行）
 	Skills         []EvolvedSkill // ③ 技能包 0-2 个（全局技能库）
 }
 
@@ -174,6 +175,23 @@ const evolveTimeout = 90 * time.Second
 func (s *ReactService) evolveSession(session *reactInternalSession, outcome string) {
 	// 写入模式闸门（2026-10-24 P0）：off 完全不跑进化（连候选都不生成）。
 	if s.MemoryWriteMode() == MemoryWriteModeOff {
+		return
+	}
+	// 验收闸门（Harness 根治 WP6，I-LEARN-1）：逻辑任务 enforce 模式下，只有用户显式
+	// 接受（accepted）的任务才允许产生正面技能/长期记忆晋升。事故会话里"模型自报
+	// 完成"被写成项目经验，此后每轮注入持续污染——verified（机器证据）不等于
+	// accepted（用户决定）。
+	//
+	// 关闭条件（任一）：
+	//   - taskManager 未注入 / mode != enforce：保持既有行为（灰度回退开关）；
+	//   - 任务状态为 accepted：放行；
+	//   - 任务状态为 verified/delivered-unverified：**不产生正面学习**，只记一条
+	//     "等待用户接受"的事件（可审计），影子期便于对拍漏学情况。
+	if s.evolveGateBlocks(session) {
+		s.store.addEvent(session, eventkind.System, "System",
+			"【学习闸门】本次结果仅机器验证，尚未获得用户显式接受（accepted）；本轮跳过经验/记忆沉淀。"+
+				"用户在会话里点「接受结果」后才会产生正面学习。",
+			"", "", "", "", "", true)
 		return
 	}
 	if s.evolver == nil {
@@ -418,10 +436,11 @@ var userProfileTargets = []string{"偏好", "技术栈", "沟通风格"}
 var projectPrefsTargets = []string{"项目经验"}
 
 // mergeIntoStore 把偏好增量合并进目标 store（用户画像或项目偏好）：
-// 1) prefMerger 可用 → 轻量模型产出 MergePlan（输入含归档视图=只读冲突判据、rejected=
-//    本会话否决清单=作废判据）→ ApplyMerge（人工行保护在 store 侧）；
-// 2) 合并调用失败/计划为空 → 降级直写归档小节（v1 行为，零信息丢失；对归档已有文本
-//    去重，防降级路径重复堆积——实证画像归档同一行被原样追加 3 次）。
+//  1. prefMerger 可用 → 轻量模型产出 MergePlan（输入含归档视图=只读冲突判据、rejected=
+//     本会话否决清单=作废判据）→ ApplyMerge（人工行保护在 store 侧）；
+//  2. 合并调用失败/计划为空 → 降级直写归档小节（v1 行为，零信息丢失；对归档已有文本
+//     去重，防降级路径重复堆积——实证画像归档同一行被原样追加 3 次）。
+//
 // 目标小节维持 store 当前结构；计划为空且增量为空时零副作用。
 func (s *ReactService) mergeIntoStore(sessionID, agentName string, store *userprofile.Store, targets []string, increments, rejected []string) {
 	if store == nil {
