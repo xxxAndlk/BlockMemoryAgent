@@ -31,7 +31,7 @@ type MailboxMessage struct {
 
 // MailboxStore 持久化 Agent 间邮件：Send 双写、Drain 标已读、Purge 标死信、
 // 重启后 LoadUnread 重投。append-only：状态翻转只 UPDATE status/read_at，不删行
-//（物理删除仅会话级联 DeleteSessionData）。
+// （物理删除仅会话级联 DeleteSessionData）。
 type MailboxStore struct {
 	db  *sql.DB
 	log Logger // 结构化日志器；nil 时静默（写路径错误经返回值上抛）

@@ -38,10 +38,10 @@ func TestPostgresMessagesStore_NilDBNoOp(t *testing.T) {
 // MetaAgent agentID==sessionID；子 Agent "session-N/role-K" 取 "/" 前段。
 func TestMessagesStoreSessionID(t *testing.T) {
 	cases := map[string]string{
-		"session-1":                       "session-1", // MetaAgent
-		"session-1/domain-2":              "session-1", // DomainAgent
+		"session-1":                            "session-1",  // MetaAgent
+		"session-1/domain-2":                   "session-1",  // DomainAgent
 		"session-42/domain-1/code_assistant-3": "session-42", // 多段取首段
-		"":                                "",          // 空
+		"":                                     "",           // 空
 	}
 	for agentID, want := range cases {
 		if got := messagesStoreSessionID(agentID); got != want {

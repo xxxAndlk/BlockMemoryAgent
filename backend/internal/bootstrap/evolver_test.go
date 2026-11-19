@@ -48,7 +48,7 @@ func TestParseEvolveOutputNoJSON(t *testing.T) {
 func TestNormalizeSkillName(t *testing.T) {
 	cases := []struct{ name, title, want string }{
 		{"Frame Render", "", "frame-render"},
-		{"已存在技能", "", ""}, // 非 ASCII 全折叠为空
+		{"已存在技能", "", ""},   // 非 ASCII 全折叠为空
 		{"", "动画帧渲染去重", ""}, // title 非 ASCII 同样折叠为空
 		{"  --a--b--  ", "", "a-b"},
 		{"ok-name", "", "ok-name"},

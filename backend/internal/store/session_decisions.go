@@ -22,10 +22,10 @@ import (
 
 // SessionDecision 是账本中的一条用户决策/指令/基准/否决记录。
 type SessionDecision struct {
-	ID        int64     `json:"id"`
-	SessionID string    `json:"session_id"`
-	Owner     string    `json:"owner"`
-	Kind      string    `json:"kind"`
+	ID        int64  `json:"id"`
+	SessionID string `json:"session_id"`
+	Owner     string `json:"owner"`
+	Kind      string `json:"kind"`
 	// Axis 决策轴（2026-10-24 多轴账本）：同一轴内新指令只替换该轴的旧行，
 	// 跨轴互不覆盖（"重新 AI 生图"不能撤销动画路线/锚点审批/视角）。
 	// 空串 = 无轴（普通指令/否决/参考基准，老数据兼容）。
@@ -40,16 +40,16 @@ type SessionDecision struct {
 // 决策轴枚举（2026-10-24 多轴账本，见 doc/计划_媒体动画与记忆质量修复.md §5.1）。
 // 同一轴内互斥；不同轴之间的约束同时有效。
 const (
-	AxisExecutionMode    = "execution_mode"     // execute | answer_only | discuss
-	AxisAssetSource      = "asset_source"       // existing | ai_image | video | mixed
-	AxisAnimationMethod  = "animation_method"   // frame_generate | warp | video_frames
-	AxisIdentity         = "identity"           // 当前角色/参考资产合同
-	AxisView             = "view"               // 当前视角
-	AxisApprovalAnchor   = "approval_anchor"    // pending | approved | rejected（锚点视觉审批门）
+	AxisExecutionMode    = "execution_mode"    // execute | answer_only | discuss
+	AxisAssetSource      = "asset_source"      // existing | ai_image | video | mixed
+	AxisAnimationMethod  = "animation_method"  // frame_generate | warp | video_frames
+	AxisIdentity         = "identity"          // 当前角色/参考资产合同
+	AxisView             = "view"              // 当前视角
+	AxisApprovalAnchor   = "approval_anchor"   // pending | approved | rejected（锚点视觉审批门）
 	AxisApprovalKeyframe = "approval_keyframe" // pending | approved | rejected（关键姿态审批门）
-	AxisAcceptance       = "acceptance"         // 当前验收标准
-	AxisDelivery         = "delivery"           // 当前交付形式
-	AxisGeneral          = ""                   // 无轴（普通指令/否决/参考基准）
+	AxisAcceptance       = "acceptance"        // 当前验收标准
+	AxisDelivery         = "delivery"          // 当前交付形式
+	AxisGeneral          = ""                  // 无轴（普通指令/否决/参考基准）
 )
 
 // 账本行类型。

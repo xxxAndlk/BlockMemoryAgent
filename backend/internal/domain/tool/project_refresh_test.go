@@ -65,22 +65,22 @@ func TestProjectRefresher_LastWorkDirWins(t *testing.T) {
 // TestCommandAffectsFiles 验证删改类命令识别（含 git 子命令、避免文件名误判）。
 func TestCommandAffectsFiles(t *testing.T) {
 	cases := map[string]bool{
-		"rm foo":      true,
-		"rm -rf x":    true,
-		"mkdir bar":   true,
-		"touch x":     true,
-		"mv a b":      true,
-		"cp a b":      true,
-		"git rm x":    true,
-		"git mv a b":  true,
-		"git add x":   false,
-		"ls -la":      false,
-		"cat foo":     false,
-		"go build":    false,
-		"echo rm":     false, // rm 是 echo 的参数，非命令
-		"warm up":     false,
-		"":            false,
-		"-rf":         false, // 只有选项
+		"rm foo":     true,
+		"rm -rf x":   true,
+		"mkdir bar":  true,
+		"touch x":    true,
+		"mv a b":     true,
+		"cp a b":     true,
+		"git rm x":   true,
+		"git mv a b": true,
+		"git add x":  false,
+		"ls -la":     false,
+		"cat foo":    false,
+		"go build":   false,
+		"echo rm":    false, // rm 是 echo 的参数，非命令
+		"warm up":    false,
+		"":           false,
+		"-rf":        false, // 只有选项
 	}
 	for cmd, want := range cases {
 		if got := commandAffectsFiles(cmd); got != want {

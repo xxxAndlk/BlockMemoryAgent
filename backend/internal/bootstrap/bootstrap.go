@@ -23,6 +23,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/board"
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
+	"github.com/blockmemory/agent/backend/internal/domain/checkpoint"
 	"github.com/blockmemory/agent/backend/internal/domain/memory"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/subagent"
@@ -98,10 +99,14 @@ type App struct {
 	SelfClaimStore      team.ClaimStore               // C-06 三表存储
 	SelfClaimSupervisor *team.WorkerSupervisor        // C-06 Worker 控制面
 	Promotion           *agent.MemoryPromotionService // C-05 团队经验候选/晋升（默认 shadow）
-	Logger              *logger.Logger                // 结构化会话日志器
-	Plugins             *plugins.Manager              // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
-	Widgets             *widgets.Manager              // 界面部件管理器（widgets/ 目录包，Widget 机制）
-	WorkDir             string                        // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
+	// LogicalTask 逻辑任务管理器（Harness 根治 WP1，2026-11-18）：HTTP 查询/接受端点用。
+	LogicalTask *team.TaskManager
+	// ActionPipeline Action 事务管线（WP2）：审计面板与测试用。
+	ActionPipeline *tool.ActionPipeline
+	Logger         *logger.Logger   // 结构化会话日志器
+	Plugins        *plugins.Manager // 插件管理器（热插拔插件，设计文档《插件系统设计 v2》）
+	Widgets        *widgets.Manager // 界面部件管理器（widgets/ 目录包，Widget 机制）
+	WorkDir        string           // 进程默认工作目录（work_dir 参数为空时各工作目录级配置的回落目录）
 	// SkillsDir 经验技能目录（config/skills_learned/，与 evolver 落库同口径）：
 	// DELETE /api/skills/learned/:name 删文件前做目录内安全校验用。
 	SkillsDir string
@@ -366,6 +371,39 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// （computer_use 全工具自标 destructive）不再推「需确认」，直接执行。仅关闭确认链，
 	// 命令黑名单与写路径沙箱不受影响（见 SafetyConfig.ToolApprovalDisabled 注释）。
 	toolRegistry.SetApprovalDisabled(cfg.Agent.ToolApprovalDisabled)
+	// --- Harness 根治装配（2026-11-18，doc/计划_Harness合同事务与语义编辑根治.md）---
+	//
+	// 两个独立组件，各自受配置开关控制、可独立回退：
+	//   logicalTaskMgr  逻辑任务合同（WP1）：默认 shadow（只观测不注入/不授权）；
+	//   actionPipeline  Action 事务管线（WP2）：默认 off（零行为）。
+	// 两者都依赖 PG 事件表（EnsureLogicalTaskSchema 已随 ensureSchemas 建好）。
+	logicalTaskMgr := team.NewTaskManager(
+		store.NewPGLogicalTaskStore(pgStore.DB()),
+		cfg.Agent.LogicalTaskMode,
+	)
+	// 观测落点：任务划分/继承/接受/否决一律打日志（shadow 对拍与审计依据）。
+	logicalTaskMgr.SetObservationSink(func(obs team.Observation) {
+		log.Printf("[logical-task] %s session=%s task=%s rev=%d hash=%s actor=%s reason=%s",
+			obs.Action, obs.SessionID, obs.TaskID, obs.Revision, shortHashForLog(obs.ContentHash), obs.Actor, obs.Reason)
+	})
+	// Shadow Git/内容寻址检查点目录（WP2 §6.4）：落 BMA 数据目录，绝不写用户 .git 或工作区。
+	checkpointDir := cfg.Agent.CheckpointDir
+	if checkpointDir == "" {
+		checkpointDir = filepath.Join(workDir, ".bma", "checkpoints")
+	}
+	checkpointStore := checkpoint.NewStore(checkpointDir, checkpoint.WithMaxFiles(cfg.Agent.CheckpointMaxFiles))
+	actionPipeline := tool.NewActionPipeline(tool.ActionPipelineConfig{
+		Mode:   cfg.Agent.ActionTransactionMode,
+		Store:  checkpointStore,
+		Events: actionEventSinkAdapter{inner: store.NewPGActionEventStore(pgStore.DB())},
+		// 验收规则与检查点内部文件对执行角色永久 deny（I-VERIFY-2）：
+		// 这里只管 harness 强制逻辑只读，不冒充操作系统 ACL；RunCommand 事后 diff 同样覆盖。
+		Protected: []string{".bma/verification", ".bma/checkpoints"},
+	})
+	toolRegistry.SetActionPipeline(actionPipeline)
+	log.Printf("[bootstrap] harness: logical_task_mode=%s action_transaction_mode=%s checkpoint=%s",
+		cfg.Agent.LogicalTaskMode, cfg.Agent.ActionTransactionMode, checkpointStore.Dir())
+
 	// 注入角色级写路径解析器（Layer 4）：roleID -> 该角色 Sandbox.AllowedWritePaths。
 	// 角色未配 sandbox.allowed_write_paths 时返 nil，enforceRoleWritePath 跳过，现有写行为不变。
 	toolRegistry.SetRoleWritePathResolver(func(roleID string) []string {
@@ -526,22 +564,23 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	// 第十五步：创建子 Agent 调度器，并注册工具调用能力。
 	// 超时与循环参数从 cfg.Agent 派生（负数表示不限制，由 loopConfig 归一为 0）。
 	reactCfg := agent.ReactRuntimeConfig{
-		MaxIterations:              cfg.Agent.ToolCallMaxRounds,
-		LLMTimeoutSec:              cfg.Agent.ReactLLMTimeoutSec,
-		RetryCount:                 cfg.Agent.RetryCount,
-		RetryBackoffMs:             cfg.Agent.RetryBackoffMs,
-		HistoryMaxMessages:         cfg.Agent.HistoryMaxMessages,
-		ToolOutputHistoryMaxRunes:  cfg.Agent.ToolOutputHistoryMaxRunes,
-		TokenBudgetPerGoal:         cfg.Agent.TokenBudgetPerGoal,
-		TokenBudgetPerRole:         cfg.Agent.TokenBudgetPerRole,
-		ContextTokenBudget:         cfg.Agent.ContextTokenBudget,
-		SessionMaxWallClockMin:     cfg.Agent.SessionMaxWallClockMin,
-		ToolResultDumpRunes:        cfg.Agent.ToolResultDumpRunes,
-		ToolResultDigestRunes:      cfg.Agent.ToolResultDigestRunes,
-		StaleToolEvictRounds:       cfg.Agent.StaleToolEvictRounds,
-		AgentsMDMaxRunes:           cfg.Agent.AgentsMDMaxRunes,
-		ToolParallelEnabled:        cfg.Agent.ToolParallelEnabled,
-		ToolParallelMaxConcurrency: cfg.Agent.ToolParallelMaxConcurrency,
+		MaxIterations:               cfg.Agent.ToolCallMaxRounds,
+		LLMTimeoutSec:               cfg.Agent.ReactLLMTimeoutSec,
+		RetryCount:                  cfg.Agent.RetryCount,
+		RetryBackoffMs:              cfg.Agent.RetryBackoffMs,
+		HistoryMaxMessages:          cfg.Agent.HistoryMaxMessages,
+		ToolOutputHistoryMaxRunes:   cfg.Agent.ToolOutputHistoryMaxRunes,
+		TokenBudgetPerGoal:          cfg.Agent.TokenBudgetPerGoal,
+		TokenBudgetPerRole:          cfg.Agent.TokenBudgetPerRole,
+		ContextTokenBudget:          cfg.Agent.ContextTokenBudget,
+		SessionMaxWallClockMin:      cfg.Agent.SessionMaxWallClockMin,
+		ToolResultDumpRunes:         cfg.Agent.ToolResultDumpRunes,
+		ToolResultDigestRunes:       cfg.Agent.ToolResultDigestRunes,
+		StaleToolEvictRounds:        cfg.Agent.StaleToolEvictRounds,
+		AgentsMDMaxRunes:            cfg.Agent.AgentsMDMaxRunes,
+		ToolParallelEnabled:         cfg.Agent.ToolParallelEnabled,
+		ToolParallelMaxConcurrency:  cfg.Agent.ToolParallelMaxConcurrency,
+		LogicalTaskContractMaxRunes: cfg.Agent.LogicalTaskContractMaxRunes,
 	}
 	// 工具图片长边降采样（TODO 第9项④）：agent 包级旋钮，全部工具图片唯一汇流点
 	// （toolRegistryAdapter.Dispatch）读取；<=0 关闭。进程生命周期内不变。
@@ -791,6 +830,9 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 	agentSvc.SetDomainClassifier(cls)
 	agentSvc.SetLogger(sessionLogger)
 	agentSvc.SetRuntimeConfig(reactCfg)
+	// 逻辑任务合同（Harness 根治 WP1）：创建/修订当前任务、维护不变量与验收规则。
+	// mode=shadow 只建不注入（对拍）；enforce 才注入上下文并参与 Action 授权。
+	agentSvc.SetTaskManager(logicalTaskMgr)
 	// 注入 Agent 树持久化层：Register/Finish/Cancel 后 best-effort 写入 PG,
 	// 服务重启后 TreeFor lazy init 调 LoadFromStore 恢复历史节点(元数据恢复)。
 	agentSvc.SetTreeStore(store.NewPostgresTreeStore(pgStore.DB()))
@@ -1936,6 +1978,44 @@ func validatePaths(paths ConfigPaths) error {
 	return nil
 }
 
+// actionEventSinkAdapter 把 store.PGActionEventStore 适配成 tool.ActionEventSink：
+// 两个包各自定义同形事件类型（store 是基础设施层，tool 是领域层，避免双向依赖），
+// 由 bootstrap 做唯一一处显式转换——转换点集中，缺失字段编译期即可发现。
+type actionEventSinkAdapter struct {
+	inner *store.PGActionEventStore
+}
+
+// Append 实现 tool.ActionEventSink。
+func (a actionEventSinkAdapter) Append(ctx context.Context, ev tool.ActionEvent) error {
+	if a.inner == nil {
+		return nil
+	}
+	return a.inner.Append(ctx, store.ActionEvent{
+		ActionID:         ev.ActionID,
+		SessionID:        ev.SessionID,
+		LogicalTaskID:    ev.LogicalTaskID,
+		ContractRevision: ev.ContractRevision,
+		Seq:              ev.Seq,
+		Phase:            ev.Phase,
+		Tool:             ev.Tool,
+		RequestRef:       ev.RequestRef,
+		BeforeCheckpoint: ev.BeforeCheckpoint,
+		AfterCheckpoint:  ev.AfterCheckpoint,
+		MutationRef:      ev.MutationRef,
+		ErrorCategory:    ev.ErrorCategory,
+		Payload:          ev.Payload,
+		CreatedAt:        ev.CreatedAt,
+	})
+}
+
+// shortHashForLog 日志里只留 hash 前 12 位（可对照、不刷屏）。
+func shortHashForLog(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
+}
+
 // ensureSchemas 确保业务所需的数据库 schema 与向量维度正确。
 //
 // 参数：
@@ -1960,6 +2040,7 @@ func ensureSchemas(ctx context.Context, pgStore *store.PostgresStore, expectedDi
 		"session_decisions":      store.EnsureSessionDecisionsSchema,
 		"role_evolution_prompts": store.EnsureRoleEvolutionSchema,
 		"workflow":               store.EnsureWorkflowSchema,
+		"logical_tasks":          store.EnsureLogicalTaskSchema, // Harness 根治 WP1/WP2（2026-11-18）三表
 	} {
 		if err := fn(ctx, pgStore.DB()); err != nil {
 			return fmt.Errorf("ensure %s schema: %w", name, err)

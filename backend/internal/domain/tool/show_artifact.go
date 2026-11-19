@@ -16,7 +16,7 @@ package tool
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -269,13 +269,13 @@ func (t *showArtifactTool) relToWorkDir(workDir, abs string) (string, error) {
 }
 
 // writeInlineHTML 把内联 HTML 落盘到 <工作目录>/.bma/artifacts/，返回绝对路径。
-// 文件名 = 时间戳 + 内容 sha1 前 8 位：同内容重复展示复用同一文件，不同内容不互相覆盖。
+// 文件名 = 时间戳 + 内容 sha256 前 8 位：同内容重复展示复用同一文件，不同内容不互相覆盖。
 func (t *showArtifactTool) writeInlineHTML(workDir, content string) (string, error) {
 	dir := filepath.Join(workDir, ".bma", "artifacts")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	sum := sha1.Sum([]byte(content))
+	sum := sha256.Sum256([]byte(content))
 	name := fmt.Sprintf("%d-%s.html", time.Now().Unix(), hex.EncodeToString(sum[:4]))
 	abs := filepath.Join(dir, name)
 	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {

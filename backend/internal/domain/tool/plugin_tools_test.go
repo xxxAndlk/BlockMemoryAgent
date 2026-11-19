@@ -18,14 +18,14 @@ import (
 
 // fakePluginManager 是 PluginManager 的测试替身。
 type fakePluginManager struct {
-	installed atomic.Int32 // Install 调用计数（审批拒绝断言用）
-	installReq InstallRequest
-	searchCalls atomic.Int32
-	enableCalls atomic.Int32
+	installed    atomic.Int32 // Install 调用计数（审批拒绝断言用）
+	installReq   InstallRequest
+	searchCalls  atomic.Int32
+	enableCalls  atomic.Int32
 	disableCalls atomic.Int32
-	infos  []PluginInfo
-	search []SearchResult
-	notes  []string
+	infos        []PluginInfo
+	search       []SearchResult
+	notes        []string
 }
 
 func (f *fakePluginManager) List() []PluginInfo { return f.infos }

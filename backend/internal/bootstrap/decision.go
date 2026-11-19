@@ -45,7 +45,7 @@ func (r *decisionShadowRecorder) RecordShadow(ctx context.Context, ev decision.S
 
 // newDecisionLayer 装配决策层。provider 选择：
 //   - decision.provider=http 且 http_url 非空 → HTTPProvider（TypeSafe 兼容面），
-	//     失败自动回退 LLM 兜底；
+//     失败自动回退 LLM 兜底；
 //   - 其余（默认 llm）→ LLMProvider（CallDecisionWithRetry：decision_model
 //     未配置回退 lightweight，白拿缓存/绑定/热更新/日志）。
 //

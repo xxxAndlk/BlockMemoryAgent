@@ -43,10 +43,10 @@ func TestScheduleFollowup_Validation(t *testing.T) {
 	}}
 	ctx := WithSessionID(context.Background(), "s1")
 	for _, args := range []map[string]any{
-		{"text": "x"},                              // 缺 delay_minutes
-		{"delay_minutes": 0.5, "text": "x"},        // 间隔过小
-		{"delay_minutes": 60},                      // 缺 text
-		{"delay_minutes": 60, "text": "   "},       // 空白 text
+		{"text": "x"},                        // 缺 delay_minutes
+		{"delay_minutes": 0.5, "text": "x"},  // 间隔过小
+		{"delay_minutes": 60},                // 缺 text
+		{"delay_minutes": 60, "text": "   "}, // 空白 text
 	} {
 		res := tl.Execute(ctx, args)
 		if res.Error == "" {

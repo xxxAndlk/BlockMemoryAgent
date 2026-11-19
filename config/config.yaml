@@ -74,6 +74,17 @@ agent:
   task_max_runes_hard: 4000      # 派发 task 文本硬上限（TODO #35）：超硬限拒绝；仍拦截全量规格转贴（事故日志 3521/2315 runes 区间已上移）
   react_llm_timeout_sec: 1800    # ReAct 单次 LLM 调用超时（秒），负数表示仅受会话取消控制。glm-5.2 推理模型 thinking 慢,180s 常被截断；600s 仍不够——2026-08-13 实证 MetaAgent 汇总轮（4 领域摘要 ~20K input）10 分钟被掐断,整品验收没派出去,故 600->1200；2026-08-20 ark glm-5.3 流式两次中途静默(440s/15min+),1200->1800 给慢思考留满余量。配合 generate() 不在 deadline 上重试,卡死时 1800s 即报错。
   sub_agent_timeout_min: 120     # 子 Agent 独立执行超时（分钟），负数表示不限制。TODO #35 放开预算：60->120，慢推理（thinking）下长任务不再撞超时。
+  # -- Harness 根治开关（2026-11-18，doc/计划_Harness合同事务与语义编辑根治.md §5.4）--
+  # 四组开关各自独立、各自可回退；默认只观察，禁止直接把存量会话切 enforce。
+  # 非法值一律回落最保守档并告警（config.applyHarnessModeDefaults 有单测锁定）。
+  logical_task_mode: shadow        # 逻辑任务合同（WP1）：off=完全不建；shadow=建并记录任务划分/不变量继承，不注入不授权（默认，对拍期）；enforce=合同注入上下文尾部 system 块（不参与压缩）并作为 Action 授权依据
+  action_transaction_mode: off     # Action 事务管线（WP2）：off=零行为（默认）；shadow=照常执行但完整记录"enforce 会拒绝/回滚什么"；enforce=真实阻断 + 越界回滚本 Action（快照失败/不完整时 fail closed）
+  semantic_edit_mode: off          # 语义 PatchPlan（WP4）：off=不启用（默认）；shadow=只在能定位唯一目标时记录计划；enforce=worker 不可用时 fail closed（绝不静默回退正则盲写）
+  contract_verification_mode: shadow # 合同验收（WP3/WP5）：off=不判定；shadow=判定并记录 L0（不变量/写范围/diff）结论（默认）；enforce=必需证据缺失只能交付 unverified（构建通过不等于验收通过）
+  checkpoint_max_files: 20000      # 单次工作区快照文件数上限：超限时快照标 degraded（不静默声称完整），enforce 下生产写入拒绝
+  logical_task_contract_max_runes: 2200 # 合同块注入上限（rune）：必留段先占、可选段整段跳过，禁止最后整体截尾
+  # checkpoint_dir:               # 可选：检查点根目录（默认 <默认工作目录>/.bma/checkpoints，绝不写用户 .git）
+  # semantic_worker_path:         # 可选：语义编辑 worker 入口（默认 tools/semantic-edit/worker.mjs）；enforce 未配置时 fail closed
   # 子 Agent 全局并发上限（同时在跑总数，超额 FIFO 排队、排队不计墙钟）
   max_concurrent_sub_agents: 8
   # 协作问答超时升级（分钟）：request/escalate 超期未获 reply 升级给提问方父 Agent

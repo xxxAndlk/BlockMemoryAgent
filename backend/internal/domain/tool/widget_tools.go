@@ -16,12 +16,12 @@ package tool
 // 已打开的卡片收到即原地重建 iframe——Agent 改代码用户端即时生效，无需重发工件。
 
 import (
-	"context"  // 工具执行上下文
+	"context"       // 工具执行上下文
 	"encoding/json" // connector 入参解析（JSON 对象 → ConnectorSpec）
-	"fmt"      // 结果文案
+	"fmt"           // 结果文案
 	"path/filepath" // 回收站路径回执文案（Windows 反斜杠转正斜杠）
-	"strings" // 文案拼接
-	"time"    // updated_at 格式化
+	"strings"       // 文案拼接
+	"time"          // updated_at 格式化
 
 	"github.com/google/jsonschema-go/jsonschema" // 入参 schema
 

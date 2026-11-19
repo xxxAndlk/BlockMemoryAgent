@@ -32,10 +32,10 @@ func TestEscalateGearTool_RequiredArgs(t *testing.T) {
 		return "ok", nil
 	})
 	for _, args := range []map[string]any{
-		{"task_brief": "修 bug"},                       // 缺 reason
-		{"reason": "要改文件"},                            // 缺 task_brief
-		{"reason": "   ", "task_brief": "修 bug"},      // 空白 reason
-		{"reason": "要改文件", "task_brief": ""},         // 空 brief
+		{"task_brief": "修 bug"},                  // 缺 reason
+		{"reason": "要改文件"},                       // 缺 task_brief
+		{"reason": "   ", "task_brief": "修 bug"}, // 空白 reason
+		{"reason": "要改文件", "task_brief": ""},     // 空 brief
 	} {
 		res, _ := r.Dispatch(context.Background(), "escalate_gear", args)
 		if res.Success {

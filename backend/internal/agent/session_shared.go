@@ -15,23 +15,23 @@ import (
 // 同时被旧版会话存储和 ReAct 会话存储共用，
 // 用于在内存中统一传递事件数据。
 type internalEvent struct {
-	Seq          int64     `json:"seq,omitempty"`           // 会话内单调序号（TODO #20① append-only 幂等键）；0=未分配（仅内存/合成事件）
-	Type         string    `json:"type"`                    // Type 表示事件类型，例如消息、工具调用等
-	Agent        string    `json:"agent"`                   // Agent 表示产生该事件的 Agent 标识
-	Message      string    `json:"message"`                 // Message 是事件的主要文本内容
-	Kind         string    `json:"kind,omitempty"`          // Kind 是事件的细分类别，如 think/prompt 等调试类别
-	Tool         string    `json:"tool,omitempty"`          // Tool 表示被调用的工具名称
-	ToolPath     string    `json:"tool_path,omitempty"`     // ToolPath 表示工具在配置中的路径
-	ToolOutput   string    `json:"tool_output,omitempty"`   // ToolOutput 是工具执行返回的输出内容
-	ToolError    string    `json:"tool_error,omitempty"`    // ToolError 是工具执行时产生的错误信息
-	Success      bool      `json:"success,omitempty"`       // Success 标记工具调用是否成功
-	Timestamp    time.Time `json:"timestamp"`               // Timestamp 记录事件产生的时间点
-	Prompt       string    `json:"prompt,omitempty"`        // Prompt 保存发送给模型的提示词内容
-	InputTokens  int       `json:"input_tokens,omitempty"`  // InputTokens 是输入 token 数量，用于统计成本
-	OutputTokens int       `json:"output_tokens,omitempty"` // OutputTokens 是输出 token 数量，用于统计成本
-	CacheHitTokens  int    `json:"cache_hit_tokens,omitempty"`  // CacheHitTokens 缓存命中 token 数（TODO #40 可观测）
-	CacheMissTokens int    `json:"cache_miss_tokens,omitempty"` // CacheMissTokens 缓存未命中 token 数（TODO #40 可观测）
-	DetailJSON   string    `json:"detail_json,omitempty"`   // DetailJSON 用于保存额外的结构化详情
+	Seq             int64     `json:"seq,omitempty"`               // 会话内单调序号（TODO #20① append-only 幂等键）；0=未分配（仅内存/合成事件）
+	Type            string    `json:"type"`                        // Type 表示事件类型，例如消息、工具调用等
+	Agent           string    `json:"agent"`                       // Agent 表示产生该事件的 Agent 标识
+	Message         string    `json:"message"`                     // Message 是事件的主要文本内容
+	Kind            string    `json:"kind,omitempty"`              // Kind 是事件的细分类别，如 think/prompt 等调试类别
+	Tool            string    `json:"tool,omitempty"`              // Tool 表示被调用的工具名称
+	ToolPath        string    `json:"tool_path,omitempty"`         // ToolPath 表示工具在配置中的路径
+	ToolOutput      string    `json:"tool_output,omitempty"`       // ToolOutput 是工具执行返回的输出内容
+	ToolError       string    `json:"tool_error,omitempty"`        // ToolError 是工具执行时产生的错误信息
+	Success         bool      `json:"success,omitempty"`           // Success 标记工具调用是否成功
+	Timestamp       time.Time `json:"timestamp"`                   // Timestamp 记录事件产生的时间点
+	Prompt          string    `json:"prompt,omitempty"`            // Prompt 保存发送给模型的提示词内容
+	InputTokens     int       `json:"input_tokens,omitempty"`      // InputTokens 是输入 token 数量，用于统计成本
+	OutputTokens    int       `json:"output_tokens,omitempty"`     // OutputTokens 是输出 token 数量，用于统计成本
+	CacheHitTokens  int       `json:"cache_hit_tokens,omitempty"`  // CacheHitTokens 缓存命中 token 数（TODO #40 可观测）
+	CacheMissTokens int       `json:"cache_miss_tokens,omitempty"` // CacheMissTokens 缓存未命中 token 数（TODO #40 可观测）
+	DetailJSON      string    `json:"detail_json,omitempty"`       // DetailJSON 用于保存额外的结构化详情
 }
 
 // toAgentEvent 将内部使用的 internalEvent 转换为对外暴露的 Event DTO。
@@ -43,22 +43,22 @@ func toAgentEvent(e *internalEvent) *Event {
 	}
 	// 逐个字段拷贝，保持数据语义不变
 	return &Event{
-		Type:         e.Type,
-		Agent:        e.Agent,
-		Message:      e.Message,
-		Kind:         e.Kind,
-		Tool:         e.Tool,
-		ToolPath:     e.ToolPath,
-		ToolOutput:   e.ToolOutput,
-		ToolError:    e.ToolError,
-		Success:      e.Success,
-		Timestamp:    e.Timestamp,
-		Prompt:       e.Prompt,
-		InputTokens:  e.InputTokens,
-		OutputTokens: e.OutputTokens,
+		Type:            e.Type,
+		Agent:           e.Agent,
+		Message:         e.Message,
+		Kind:            e.Kind,
+		Tool:            e.Tool,
+		ToolPath:        e.ToolPath,
+		ToolOutput:      e.ToolOutput,
+		ToolError:       e.ToolError,
+		Success:         e.Success,
+		Timestamp:       e.Timestamp,
+		Prompt:          e.Prompt,
+		InputTokens:     e.InputTokens,
+		OutputTokens:    e.OutputTokens,
 		CacheHitTokens:  e.CacheHitTokens,
 		CacheMissTokens: e.CacheMissTokens,
-		DetailJSON:   e.DetailJSON,
+		DetailJSON:      e.DetailJSON,
 	}
 }
 

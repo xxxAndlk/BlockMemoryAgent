@@ -183,6 +183,10 @@ type Registry struct {
 	// externalAgents 是 CallExternalAgent 工具的外部 Agent 注册表（external_agents.yaml
 	// 经 SetExternalAgentDefs 整表热注入；NewBuiltinRegistry 恒初始化，未注入时空表）。
 	externalAgents *externalAgentRegistry
+	// actionPipeline 统一 Action 事务管线（Harness 根治 WP2）：所有生产写入经
+	// resolve → authorize → checkpoint → execute → observe → verify → commit/rollback。
+	// nil（默认）= 未启用，零开销（off 模式等价）。bootstrap 按 agent.action_transaction_mode 注入。
+	actionPipeline *ActionPipeline
 }
 
 // NewBuiltinRegistry 创建一个已注册所有默认工具的 Registry 实例。
@@ -487,6 +491,24 @@ func (r *Registry) SetApprovalDisabled(disabled bool) {
 	if r != nil {
 		r.approvalDisabled = disabled
 	}
+}
+
+// SetActionPipeline 注入统一 Action 事务管线（Harness 根治 WP2）。
+// nil / mode=off 时 Dispatch 与旧行为逐字节一致；bootstrap 按
+// agent.action_transaction_mode 决定注入模式。管线挂在 Dispatch 而不是 adapter，
+// 保证程序化调用（workflow/verifyloop）也进同一套授权与变更审计（I-EXEC-1）。
+func (r *Registry) SetActionPipeline(p *ActionPipeline) {
+	if r != nil {
+		r.actionPipeline = p
+	}
+}
+
+// ActionPipeline 返回已注入的管线（测试/管理面只读访问）。
+func (r *Registry) ActionPipeline() *ActionPipeline {
+	if r == nil {
+		return nil
+	}
+	return r.actionPipeline
 }
 
 // SetRoleToolGateResolver 注入角色工具白名单硬门解析器（dormant opt-in，
@@ -797,7 +819,19 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args map[string]an
 	}
 
 	// 调用工具实现获取执行结果。
-	result := t.Execute(ctx, args)
+	// 统一 Action 事务管线（Harness 根治 WP2 §6.1）：这里是**唯一**生产执行入口——
+	// WriteFile/EditFile/RunCommand/插件 MCP 工具与程序化调用都经 Dispatch，管线不能
+	// 只挂在 toolRegistryAdapter 上，否则会漏掉 workflow/verifyloop 等程序化调用方。
+	// off 模式（或未注入管线）直接执行，与旧行为逐字节一致。
+	var result *Result
+	if r.actionPipeline != nil && r.actionPipeline.Enabled() {
+		actionWD := r.exec.workDirOf(ctx)
+		result, _ = r.actionPipeline.Run(ctx, name, t, args, actionWD, func() *Result {
+			return t.Execute(ctx, args)
+		})
+	} else {
+		result = t.Execute(ctx, args)
+	}
 
 	// ReadFile 成功读取后：连续第 2 次相同参数调用时附上翻页提醒（内容直返，不拦截）；
 	// 按总行数标记长文件状态（下一次连读上限放宽，）。
@@ -973,10 +1007,10 @@ const SpecTombstonePrefix = specTombstonePrefix
 // 普通共享记忆槽：不物理删除，frontmatter 打 invalidated_at 标记、body/Files 原样保留——
 // dispatcher 注入侧判 stale 后照常注入并附行号漂移警告（常量值/签名类结论仍可直接采信）。
 // 实证：物理删除后无任何重存引导，下次派发/复用拿裸任务从零重读同一批文件
-//（单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
+// （单领域 Agent 两小时 ReadFile 610 次 + SearchInFiles 351 次）。
 // spec 槽位（<agentID>:spec[...]) 不标 stale 而写墓碑（TODO #74，维持现状）：
 // "被失效"与"从未写"在派发报错中语义不同，物理删导致 meta 误诊 key 覆盖
-//（实证 2026-08-25：meta 误诊"每 parent 只存一份 spec 互相覆盖"改串行重派白烧一轮）。
+// （实证 2026-08-25：meta 误诊"每 parent 只存一份 spec 互相覆盖"改串行重派白烧一轮）。
 func (r *Registry) invalidateSharedMemoryForPath(ctx context.Context, path string) {
 	if r.sharedMemory == nil || path == "" {
 		return
@@ -1141,7 +1175,7 @@ const longFileReadLines = 500
 
 // resetSameReadForPath 清零指定 scope 中匹配 path 的连读计数（确认性复读放行）：
 // WriteFile/EditFile 成功写某路径后调用——编辑后的同区间复读是确认性工作流
-//（Read(A)→Write(A)→Read(A)→Read(A) 不再第 3 次被杀），纯探索性 3 连读仍杀。
+// （Read(A)→Write(A)→Read(A)→Read(A) 不再第 3 次被杀），纯探索性 3 连读仍杀。
 func (r *Registry) resetSameReadForPath(scopeKey, path string) {
 	if scopeKey == "" || path == "" {
 		return

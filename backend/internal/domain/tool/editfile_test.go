@@ -244,7 +244,7 @@ func TestEditFile_EmptyOldStringRejected(t *testing.T) {
 
 // TestEditFile_InvalidatesSharedMemory 验证 Layer 2：EditFile 成功后，
 // 引用同 path 的 KV entry 被标记 stale（invalidated_at）但不物理删除、body 保留
-//（与 WriteFile 行为一致）。
+// （与 WriteFile 行为一致）。
 func TestEditFile_InvalidatesSharedMemory(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "bar.go")

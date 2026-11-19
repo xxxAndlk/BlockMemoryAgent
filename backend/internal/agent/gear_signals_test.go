@@ -35,10 +35,10 @@ func TestGearSignalOnSend(t *testing.T) {
 func TestGearSignalOnStop(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
-		name   string
-		gear   string
-		start  time.Time
-		want   bool
+		name  string
+		gear  string
+		start time.Time
+		want  bool
 	}{
 		{"集群档+30s 内→命中", "cluster", now.Add(-10 * time.Second), true},
 		{"集群档+超窗→不命中", "cluster", now.Add(-2 * time.Minute), false},

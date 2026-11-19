@@ -15,15 +15,15 @@ import (
 
 // Notifier 会话终态 Webhook 通知器（零依赖，nil 安全）。
 type Notifier struct {
-	url     string          // 目标 URL；空=关闭
-	events  map[string]bool // 关心的事件（会话终态值：completed/error/...）
-	client  *http.Client    // 3s 超时独立客户端，不占用默认客户端连接池
+	url     string               // 目标 URL；空=关闭
+	events  map[string]bool      // 关心的事件（会话终态值：completed/error/...）
+	client  *http.Client         // 3s 超时独立客户端，不占用默认客户端连接池
 	lastFir map[string]time.Time // sessionID -> 上次通知时间（同会话同状态 60s 去重防抖）
 }
 
 // NotifyWebhookPayload 终态通知报文（POST body）。
 type NotifyWebhookPayload struct {
-	Type       string `json:"type"`        // 固定 "session_final"
+	Type       string `json:"type"` // 固定 "session_final"
 	SessionID  string `json:"session_id"`
 	Status     string `json:"status"`      // 终态值：completed / error / ...
 	Goal       string `json:"goal"`        // 会话目标（截断防超大报文）
@@ -47,9 +47,9 @@ func NewNotifier(url string, events []string) *Notifier {
 		return nil
 	}
 	return &Notifier{
-		url:    url,
-		events: set,
-		client: &http.Client{Timeout: 3 * time.Second},
+		url:     url,
+		events:  set,
+		client:  &http.Client{Timeout: 3 * time.Second},
 		lastFir: make(map[string]time.Time),
 	}
 }
@@ -102,7 +102,7 @@ type NotifyRunFinalPayload struct {
 	Status     string `json:"status"` // done / failed / aborted
 	RecipeID   string `json:"recipe_id"`
 	Note       string `json:"note,omitempty"` // 补充说明（pause_reason 等）
-	OccurredAt string `json:"occurred_at"` // RFC3339
+	OccurredAt string `json:"occurred_at"`    // RFC3339
 }
 
 // NotifyRunFinal 工作流量产 run 终态通知入口（workflow 引擎终态回调；异步 best-effort）。
