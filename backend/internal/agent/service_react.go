@@ -4496,6 +4496,11 @@ func (s *ReactService) runSession(session *reactInternalSession) { // 获取会�
 	session.History = result.History
 	s.store.mu.Unlock()
 
+	// 逻辑任务结算（Harness 根治 WP3/WP6）：先把任务推进到终态（通常
+	// delivered-unverified），用户点「接受结果」后才 accepted；Evolver 闸门据此判定。
+	// 必须在 evolveSession 之前，否则闸门看到的是过期的 active 状态。
+	s.settleLogicalTask(session, "success")
+
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
 	// （用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
 	s.evolveSession(session, "success")
@@ -4742,6 +4747,11 @@ func (s *ReactService) resumeSession(session *reactInternalSession) {
 	session.EndedAt = &now
 	session.History = result.History
 	s.store.mu.Unlock()
+
+	// 逻辑任务结算（Harness 根治 WP3/WP6）：先把任务推进到终态（通常
+	// delivered-unverified），用户点「接受结果」后才 accepted；Evolver 闸门据此判定。
+	// 必须在 evolveSession 之前，否则闸门看到的是过期的 active 状态。
+	s.settleLogicalTask(session, "success")
 
 	// 会话进化（2026-09-02 设计 §6.1）：一次轻量模型调用产出三类沉淀
 	// （用户偏好/项目经验/技能包），失败降级纯画像提取，零副作用。
@@ -5296,6 +5306,10 @@ func (s *ReactService) setSessionError(session *reactInternalSession, msg string
 
 	// 添加错误事件。
 	s.store.addEvent(session, eventkind.Error, "System", msg, "", "", "", "", "", false)
+
+	// 逻辑任务结算（同成功路径）：失败/取消的任务不得留在 active，也绝不直接 accepted
+	//（需显式重新激活后重跑，2026-11-19 验收 P0-4）。
+	s.settleLogicalTask(session, "failed")
 
 	// 会话进化（设计 §6.1 失败会话参与进化，踩坑经验价值更高）：
 	// 用户主动取消（context canceled）不进化。

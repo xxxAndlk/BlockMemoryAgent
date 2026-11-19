@@ -5,8 +5,8 @@
 // 行为：
 //  1. 从安装目录读 app\current.json + .env 的 HTTP_ADDR；
 //  2. /api/health 通 → 直接开窗口；不通 → 自举依赖（PostgreSQL/Redis，见 deps.go）
-//    → 按版本指针拉起该版本的 bma-server.exe（隐藏控制台、stdout/stderr 落
-//    logs\desktop_*.log）→ 等就绪；
+//     → 按版本指针拉起该版本的 bma-server.exe（隐藏控制台、stdout/stderr 落
+//     logs\desktop_*.log）→ 等就绪；
 //  3. 用 WebView2 开一个自带标题栏/任务栏图标的原生窗口指向 UI（**不再落到浏览器**）；
 //     依赖自举期间窗口显示启动进度页，就绪后切到 UI；失败显示带「重试」的错误页。
 //     WebView2 不可用时才退化为 Edge/Chrome 的 --app 模式。
@@ -376,6 +376,9 @@ func startServer(root string) (string, uint32, error) {
 		"BMA_COMPUTER_USE_MCP="+filepath.Join(root, runtimeDirName, "media", "computer-use-mcp", "node_modules", "@zavora-ai", "computer-use-mcp", "dist", "launch.js"),
 		// Chromium 浏览器二进制随包（离线可用）：Playwright 按此环境变量找浏览器。
 		"BMA_PLAYWRIGHT_BROWSERS="+filepath.Join(root, runtimeDirName, "media", "playwright-browsers"),
+		// 语义编辑 worker（WP4）：随包 Node + 包内依赖。缺它时 enforce 下每次
+		// EditFile 都 fail closed（桌面版等于没有语义编辑）。
+		"BMA_SEMANTIC_EDIT_WORKER="+filepath.Join(root, runtimeDirName, "media", "semantic-edit", "worker.mjs"),
 	)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

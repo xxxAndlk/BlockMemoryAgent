@@ -240,7 +240,10 @@ function Build-RuntimePayload {
     if (-not (Test-RuntimeAvailable $Repo)) { throw "缺少运行时源包（$cache 下需要 pg16.zip / pgvector-pg16.zip / redis-win.zip），先跑 installer\fetch-runtime.ps1" }
     $prepared = Join-Path $cache 'prepared'
     # 配方版本：载荷**组成**变了就重建（否则会复用旧缓存，缺新加的 node/媒体桥）。
-    $recipe = 'v6-node-media-playwright-cu-headless'
+    # 配方号含 semantic-worker：载荷里多了一套 Node 语义编辑 worker（worker.mjs +
+    # 固定版本依赖 node_modules），加它就等于改组成 —— 必须重建缓存，否则旧缓存
+    # 会被复用、包里没有 worker（enforce 下 EditFile 全 fail closed）。
+    $recipe = 'v7-node-media-playwright-cu-headless-semantic'
     $recipeFile = Join-Path $prepared '.recipe'
     $recipeMatch = ((Test-Path $recipeFile) -and ((Get-Content $recipeFile -Raw).Trim() -eq $recipe))
     # 配方**明确**不匹配：组成可能整体不同，清空重建（全本地源包/缓存，代价可控）。
@@ -421,6 +424,28 @@ function Build-RuntimePayload {
                 dependencies = [ordered]@{ '@zavora-ai/computer-use-mcp' = $computerUseMcpVersion }
             })
         Invoke-NpmInstall -Dir $cuOut -What '@zavora-ai/computer-use-mcp' -Repo $Repo
+    }
+
+    # 语义编辑 worker（WP4）：随包 Node 跑，enforce 下 EditFile 靠它做 AST/CSSOM 定位。
+    # 必须在 Node 之后、烘焙载荷之前铺 —— 缺它时 enforce 会把每次编辑都 fail closed，
+    # 桌面版就等于没有语义编辑（验收报告 §6.2 指出的就是这一点）。
+    $semSrc = Join-Path $Repo 'tools\semantic-edit'
+    if (Test-Path (Join-Path $semSrc 'worker.mjs')) {
+        $semOut = Join-Path $prepared 'media\semantic-edit'
+        New-Item -ItemType Directory -Force -Path $semOut | Out-Null
+        foreach ($f in @('worker.mjs', 'package.json', 'package-lock.json', 'README.md')) {
+            $s = Join-Path $semSrc $f
+            if (Test-Path $s) { Copy-Item -Force $s $semOut }
+        }
+        # 依赖判定靠入口包的实际文件（与其它桥同一纪律：入口存在才算装好）。
+        if (-not (Test-Path (Join-Path $semOut 'node_modules\@vue\compiler-sfc\package.json'))) {
+            Write-Log '[runtime] 安装语义编辑 worker 依赖（npm install，一次）...'
+            Invoke-NpmInstall -Dir $semOut -What 'semantic-edit worker 依赖' -Repo $Repo
+        } else {
+            Write-Log '[runtime] 复用语义编辑 worker 依赖'
+        }
+    } else {
+        Write-Log '[runtime] warn: 未找到 tools\semantic-edit\worker.mjs（桌面版 semantic_edit_mode 只能留 off）'
     }
 
     # 铺到包目录（prepared 保留作缓存，下次打包直接复制）

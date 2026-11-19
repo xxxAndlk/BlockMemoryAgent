@@ -49,6 +49,13 @@ const (
 )
 
 // 逻辑任务事件类型（append-only）。
+//
+// 两类事件必须严格分开（2026-11-19 再次验收 P0-2）：
+//   - 合同快照类（created/refined）：payload 是**完整合同 JSON**，重放时整段替换投影；
+//   - 状态迁移类（其余）：payload 只是迁移参数（可为空），重放时只改状态。
+//
+// 把纯状态迁移写成 refined 会让重放尝试解码空 payload 而报错（实测
+// `decode refined payload: unexpected end of JSON input`），事件底账与投影因此不一致。
 const (
 	LogicalEventCreated    = "created"
 	LogicalEventRefined    = "refined"
@@ -60,7 +67,15 @@ const (
 	LogicalEventRejected   = "rejected"
 	LogicalEventFailed     = "failed"
 	LogicalEventCancelled  = "cancelled"
+	// LogicalEventAwaitingVerification 纯状态迁移（active → awaiting_verification）：
+	// 不含合同替换语义。正常会话结算走这个事件，不复用 refined。
+	LogicalEventAwaitingVerification = "awaiting_verification"
 )
+
+// IsContractSnapshotEvent 判定事件是否为"全量合同快照"类（payload 必须是合同 JSON）。
+func IsContractSnapshotEvent(kind string) bool {
+	return kind == LogicalEventCreated || kind == LogicalEventRefined
+}
 
 // 资源规则效果（deny 优先）。
 const (
@@ -358,6 +373,15 @@ func IsTerminalTaskStatus(s string) bool {
 	return false
 }
 
+// TaskAcceptsUserDecision 判定任务当前是否处于“等用户拍板”的交付态。
+//
+// 只有 verified（机器验收通过）与 delivered-unverified（已交付但无机器证据）两态能接受；
+// failed/cancelled 必须先显式重新激活（2026-11-19 验收 P0-4），active/awaiting_* 尚未交付，
+// accepted/superseded 已是终局。
+func TaskAcceptsUserDecision(s string) bool {
+	return s == TaskStatusVerified || s == TaskStatusDeliveredUnverified
+}
+
 // ActiveInvariants 返回仍生效的不变量（active 且未需确认的按需过滤）。
 func (c *LogicalTaskContract) ActiveInvariants() []Invariant {
 	if c == nil {
@@ -603,7 +627,10 @@ func statusTransitionAllowed(from, to string) bool {
 	case TaskStatusVerified, TaskStatusDeliveredUnverified:
 		return to == TaskStatusAccepted || to == TaskStatusSuperseded
 	case TaskStatusFailed, TaskStatusCancelled:
-		return to == TaskStatusAccepted || to == TaskStatusSuperseded
+		// 2026-11-19 验收 P0-4：失败/取消的任务不得直接进入 accepted——那会让
+		// Evolver 把失败会话当成"用户已接受"而沉淀正面经验（I-LEARN-1 被绕过）。
+		// 重做只能显式重新激活（→ active）后重新执行与重新验收，或直接废弃。
+		return to == TaskStatusActive || to == TaskStatusSuperseded
 	}
 	return false
 }
@@ -689,9 +716,17 @@ func InheritInvariants(prev *LogicalTaskContract, nextTargets []SemanticTarget, 
 
 // ApplyEvent 把一条事件应用到投影（纯函数；RebuildProjection 与增量更新共用）。
 // 事件 payload 为合同 JSON（created/refined）或迁移载荷（其余）。
+//
+// 纪律（2026-11-19 再次验收 P0-2）：把合同快照与状态迁移分开处理——快照事件必须带
+// 可解码的合同 JSON（空/坏 payload 是**坏事件**，显式报错而不是静默跳过），迁移事件
+// 只改状态，不碰合同字段。这样“写入后立即重放”才能作为一致性校验使用。
 func ApplyEvent(proj *LogicalTaskContract, ev LogicalTaskEvent) (*LogicalTaskContract, error) {
 	switch ev.Kind {
 	case LogicalEventCreated, LogicalEventRefined:
+		if strings.TrimSpace(ev.Payload) == "" {
+			return proj, fmt.Errorf("logical task: %s event %d has empty payload (contract snapshot required)",
+				ev.Kind, ev.EventID)
+		}
 		var c LogicalTaskContract
 		if err := json.Unmarshal([]byte(ev.Payload), &c); err != nil {
 			return proj, fmt.Errorf("logical task: decode %s payload: %w", ev.Kind, err)
@@ -736,6 +771,12 @@ func ApplyEvent(proj *LogicalTaskContract, ev LogicalTaskEvent) (*LogicalTaskCon
 			return nil, fmt.Errorf("logical task: verify without projection")
 		}
 		proj.Status = TaskStatusVerified
+		return proj, nil
+	case LogicalEventAwaitingVerification:
+		if proj == nil {
+			return nil, fmt.Errorf("logical task: awaiting_verification without projection")
+		}
+		proj.Status = TaskStatusAwaitingVerification
 		return proj, nil
 	case LogicalEventUnverified:
 		if proj == nil {
@@ -794,87 +835,180 @@ func RebuildProjection(sessionID, taskID string, events []LogicalTaskEvent) (*Lo
 
 // RenderContractBlock 渲染注入上下文的【当前逻辑任务】块（不参与压缩，见 I-STATE-1）。
 // 只含当前合同与活跃不变量；历史/被撤销项不注入。
+//
+// 预算语义（计划 §7.6 / 2026-11-19 验收 P1-4）：**按字段结构化装配**，绝不对整块做
+// 字符串截断——Goal、WriteSet、ExcludedSet、active 不变量（含完整 ID）与纪律段是
+// 安全关键信息，超出预算时只能压缩非安全字段（目标资源的展示细节/验收规则列表），
+// 遍历顺序固定以保证同一合同渲染结果稳定。
 func RenderContractBlock(c *LogicalTaskContract, maxRunes int) string {
 	if c == nil {
 		return ""
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "【当前逻辑任务】id=%s rev=%d 状态=%s hash=%s\n", c.LogicalTaskID, c.Revision, c.Status, shortHash(c.ContentHash))
+	// 必留段（安全约束）：永不裁掉。
+	var head strings.Builder
+	fmt.Fprintf(&head, "【当前逻辑任务】id=%s rev=%d 状态=%s hash=%s\n", c.LogicalTaskID, c.Revision, c.Status, shortHash(c.ContentHash))
 	if g := strings.TrimSpace(c.Goal); g != "" {
-		fmt.Fprintf(&b, "目标：%s\n", g)
+		fmt.Fprintf(&head, "目标：%s\n", g)
 	}
-	if len(c.Targets) > 0 {
-		b.WriteString("目标资源：\n")
-		for _, t := range c.Targets {
-			fmt.Fprintf(&b, "- %s", t.ID)
-			if t.File != "" {
-				fmt.Fprintf(&b, "（%s", t.File)
-				if t.Kind != "" {
-					fmt.Fprintf(&b, " · %s", t.Kind)
-				}
-				b.WriteString("）")
-			}
-			if t.Anchor != "" {
-				fmt.Fprintf(&b, " 锚点=%s", t.Anchor)
-			}
-			b.WriteString("\n")
-		}
-	}
-	if len(c.WriteSet) > 0 {
-		fmt.Fprintf(&b, "允许写入：%s\n", renderRules(c.WriteSet))
-	} else {
-		b.WriteString("允许写入：（未解析——生产写入将被拒绝，需先解析目标资源）\n")
-	}
+	head.WriteString(renderWriteSection(c))
 	if len(c.ExcludedSet) > 0 {
-		fmt.Fprintf(&b, "禁止触碰：%s\n", renderRules(c.ExcludedSet))
+		fmt.Fprintf(&head, "禁止触碰：%s\n", renderRules(c.ExcludedSet))
 	}
-	if invs := c.ActiveInvariants(); len(invs) > 0 {
-		b.WriteString("活跃不变量（不得破坏，违反即验收失败）：\n")
-		for _, inv := range invs {
-			line := "- [" + inv.Kind + "] " + inv.ID
-			if inv.Text != "" {
-				line += "：" + inv.Text
-			}
-			if inv.Target.File != "" {
-				line += "（" + inv.Target.File
-				if inv.Target.Kind != "" {
-					line += " · " + inv.Target.Kind
-				}
-				line += "）"
-			}
-			if inv.NeedsConfirm {
-				line += "【需确认是否仍适用】"
-			}
-			b.WriteString(line + "\n")
-		}
+	head.WriteString(renderInvariantSection(c))
+
+	// 可选段（展示细节）：分页渲染，逐条按剩余预算取舍（整条跳过，不截半行）。
+	var optional []string
+	if len(c.Targets) > 0 {
+		optional = append(optional, renderTargetSection(c.Targets)...)
 	}
 	if len(c.Acceptance) > 0 {
-		b.WriteString("验收规则：")
-		parts := make([]string, 0, len(c.Acceptance))
-		for _, a := range c.Acceptance {
-			tag := a.Kind
-			if a.Required {
-				tag += "*"
-			}
-			parts = append(parts, tag)
+		optional = append(optional, "验收规则："+renderAcceptanceLine(c.Acceptance))
+	}
+
+	discipline := "纪律：修改必须落在允许写入范围内；扩大范围必须先产生新合同记录（新 revision）；不得通过 RunCommand 绕过。"
+
+	headStr := head.String()
+	budget := maxRunes
+	if budget <= 0 {
+		// 无预算：全量渲染（调用方显式要求不限制）。
+		var b strings.Builder
+		b.WriteString(headStr)
+		if len(optional) > 0 {
+			b.WriteString(strings.Join(optional, "\n") + "\n")
 		}
-		b.WriteString(strings.Join(parts, " / ") + "\n")
+		b.WriteString(discipline)
+		return b.String()
 	}
-	b.WriteString("纪律：修改必须落在允许写入范围内；扩大范围必须先产生新合同版本；不得通过 RunCommand 绕过。")
-	out := b.String()
-	if maxRunes > 0 && len([]rune(out)) > maxRunes {
-		// 确定性装配：不截断不变量/写集段，只截断目标资源列表尾部的展示细节。
-		out = truncateRunesKeepTail(out, maxRunes)
+	remaining := budget - runeLen(headStr) - runeLen(discipline) - 1
+	var kept []string
+	for _, line := range optional {
+		need := runeLen(line) + 1
+		if remaining < need {
+			continue
+		}
+		kept = append(kept, line)
+		remaining -= need
 	}
-	return out
+	var omitted int
+	for _, line := range optional {
+		if !containsExact(kept, line) {
+			omitted++
+		}
+	}
+	var b strings.Builder
+	b.WriteString(headStr)
+	if len(kept) > 0 {
+		b.WriteString(strings.Join(kept, "\n") + "\n")
+	}
+	if omitted > 0 {
+		// 只提示"哪些展示细节没进预算"，绝不暗示安全约束被删。
+		fmt.Fprintf(&b, "（另有 %d 条展示细节未入预算；安全约束与不变量已完整注入，权威内容见事件底账）\n", omitted)
+	}
+	b.WriteString(discipline)
+	return b.String()
 }
 
-func truncateRunesKeepTail(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
+// renderWriteSection 允许写入段：空 WriteSet 必须显式告警（非"全部允许"）。
+func renderWriteSection(c *LogicalTaskContract) string {
+	if len(c.WriteSet) > 0 {
+		return "允许写入：" + renderRules(c.WriteSet) + "\n"
 	}
-	return string(r[:max]) + "\n（合同块超出预算，已截断展示；权威内容见事件底账）"
+	return "允许写入：（未解析——生产写入将被拒绝，需先解析目标资源）\n"
+}
+
+// renderInvariantSection 活跃不变量段：ID 与期望值永不截断。
+func renderInvariantSection(c *LogicalTaskContract) string {
+	invs := c.ActiveInvariants()
+	if len(invs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("活跃不变量（不得破坏，违反即验收失败）：\n")
+	for _, inv := range invs {
+		line := "- [" + inv.Kind + "] " + inv.ID
+		if inv.Text != "" {
+			line += "：" + inv.Text
+		}
+		if expected := compactJSON(inv.Expected); expected != "" && expected != "{}" {
+			line += " 期望=" + expected
+		}
+		if inv.Target.File != "" {
+			line += "（" + inv.Target.File
+			if inv.Target.Kind != "" {
+				line += " · " + inv.Target.Kind
+			}
+			line += "）"
+		}
+		if inv.NeedsConfirm {
+			line += "【需确认是否仍适用】"
+		}
+		b.WriteString(line + "\n")
+	}
+	return b.String()
+}
+
+// renderTargetSection 目标资源段：每条独立成行，便于按预算逐条取舍。
+func renderTargetSection(targets []SemanticTarget) []string {
+	lines := make([]string, 0, len(targets)+1)
+	lines = append(lines, "目标资源：")
+	for _, t := range targets {
+		line := "- " + t.ID
+		if t.Label != "" {
+			line += "「" + t.Label + "」"
+		}
+		if t.File != "" {
+			line += "（" + t.File
+			if t.Kind != "" {
+				line += " · " + t.Kind
+			}
+			line += "）"
+		}
+		if t.Anchor != "" {
+			line += " 锚点=" + t.Anchor
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// renderAcceptanceLine 验收规则摘要（展示细节，可整行舍弃）。
+func renderAcceptanceLine(rules []AcceptanceRule) string {
+	parts := make([]string, 0, len(rules))
+	for _, a := range rules {
+		tag := a.Kind
+		if a.Required {
+			tag += "*"
+		}
+		parts = append(parts, tag)
+	}
+	return strings.Join(parts, " / ")
+}
+
+func runeLen(s string) int { return len([]rune(s)) }
+
+func containsExact(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// compactJSON 把 JSON 压成一行（不换行、不缩进），空/无效返回空串。
+func compactJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return ""
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func shortHash(h string) string {

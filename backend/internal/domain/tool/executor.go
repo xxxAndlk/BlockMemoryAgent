@@ -18,14 +18,32 @@ type Callback func(result *Result)
 // Executor 负责在轻量级沙箱中运行内置工具。
 // 它管理执行目录、超时、沙箱策略、Guard 注册表以及回调。
 type Executor struct {
-	workDir  string              // 工作目录，工具执行时以此目录为上下文
-	timeout  time.Duration       // 默认执行超时时间
-	sandbox  SandboxConfig       // 沙箱配置，控制允许/禁止的行为
-	guards   *GuardRegistry      // Guard 注册表，用于拦截危险的写操作或命令
-	agentCfg        *config.AgentConfig // Agent 阈值配置，控制资源使用上限
-	callback        Callback            // 执行完成后的回调函数
-	domainClassifier project.DomainClassifier // LLM 领域命名器，供 RefreshProjectDoc 工具调用；nil 走启发式
-	roleWritePaths  func(roleID string) []string // 角色级写路径解析器：返角色 Sandbox.AllowedWritePaths；nil/空=不限制
+	workDir          string                       // 工作目录，工具执行时以此目录为上下文
+	timeout          time.Duration                // 默认执行超时时间
+	sandbox          SandboxConfig                // 沙箱配置，控制允许/禁止的行为
+	guards           *GuardRegistry               // Guard 注册表，用于拦截危险的写操作或命令
+	agentCfg         *config.AgentConfig          // Agent 阈值配置，控制资源使用上限
+	callback         Callback                     // 执行完成后的回调函数
+	domainClassifier project.DomainClassifier     // LLM 领域命名器，供 RefreshProjectDoc 工具调用；nil 走启发式
+	roleWritePaths   func(roleID string) []string // 角色级写路径解析器：返角色 Sandbox.AllowedWritePaths；nil/空=不限制
+	// semanticEdit 语义 PatchPlan 接线（WP4）：mode=off 或 worker 未注入时零行为。
+	semanticEdit SemanticEditConfig
+}
+
+// SetSemanticEdit 注入语义编辑接线（bootstrap 按 agent.semantic_edit_mode 装配）。
+func (e *Executor) SetSemanticEdit(cfg SemanticEditConfig) {
+	if e == nil {
+		return
+	}
+	e.semanticEdit = cfg
+}
+
+// semanticEditConfig 返回当前语义编辑接线（零值 = off）。
+func (e *Executor) semanticEditConfig() SemanticEditConfig {
+	if e == nil {
+		return SemanticEditConfig{}
+	}
+	return e.semanticEdit
 }
 
 // NewExecutor 创建一个新的 Executor 实例。

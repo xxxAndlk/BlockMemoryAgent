@@ -26,11 +26,15 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // defaultExcludes 是默认排除的目录/文件名（BMA 自身产物与常见巨型依赖目录）。
 // 排除项会写入快照的 Excluded 字段，便于审计"这次快照少了什么"。
+//
+// 注意：强制观察目录（WithForceInclude）优先于本清单——受保护资源（验收规则/
+// 合同事件）不得因为父目录被排除就从快照里消失（2026-11-19 验收 P0-1 修复）。
 var defaultExcludes = []string{
 	".git", ".bma", "node_modules", "dist", "build", ".next", ".nuxt",
 	"vendor", "target", "__pycache__", ".venv", "venv", ".idea", ".vscode",
@@ -109,7 +113,11 @@ func (m *MutationManifest) Empty() bool {
 type Store struct {
 	dir      string
 	excludes []string
-	maxFiles int
+	// forceInclude 是必须进入快照的路径前缀（受保护资源）。它们优先于 excludes：
+	// 即使父目录被排除，这些路径下的文件仍然被观察——否则"看不见的目录"就无法
+	// 发现篡改（2026-11-19 验收 P0-1：Shell 改 .bma/verification 却报告无变更）。
+	forceInclude []string
+	maxFiles     int
 }
 
 // Option 构造选项。
@@ -118,6 +126,20 @@ type Option func(*Store)
 // WithExcludes 追加排除项（除默认项之外）。
 func WithExcludes(patterns ...string) Option {
 	return func(s *Store) { s.excludes = append(s.excludes, patterns...) }
+}
+
+// WithForceInclude 声明必须被观察的路径前缀（工作区相对路径，正斜杠）。
+// 语义：这些路径（及其子路径）不受 excludes 影响，永远进入快照与 diff；
+// 用于验收规则、合同事件等"被篡改也必须被发现"的受保护资源。
+func WithForceInclude(prefixes ...string) Option {
+	return func(s *Store) {
+		for _, p := range prefixes {
+			p = normalizeRel(p)
+			if p != "" {
+				s.forceInclude = append(s.forceInclude, p)
+			}
+		}
+	}
 }
 
 // WithMaxFiles 设置单次快照文件数上限（<=0 用默认 20000）。
@@ -164,6 +186,78 @@ func (s *Store) Excluded() []string {
 	return append([]string{}, s.excludes...)
 }
 
+// ForceInclude 返回强制观察清单（审计用：说明哪些被排除目录仍被观察）。
+func (s *Store) ForceInclude() []string {
+	if s == nil {
+		return nil
+	}
+	return append([]string{}, s.forceInclude...)
+}
+
+// AddForceInclude 在已构造的 Store 上追加强制观察路径（bootstrap/ActionPipeline
+// 在拿到已建好的 store 后声明受保护目录时使用）。nil store 无副作用。
+func (s *Store) AddForceInclude(prefixes ...string) {
+	if s == nil {
+		return
+	}
+	for _, p := range prefixes {
+		p = normalizeRel(p)
+		if p == "" {
+			continue
+		}
+		dup := false
+		for _, exist := range s.forceInclude {
+			if exist == p {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			s.forceInclude = append(s.forceInclude, p)
+		}
+	}
+}
+
+// normalizeRel 统一相对路径写法（正斜杠、去 ./ 与前导/尾随斜杠）。
+func normalizeRel(p string) string {
+	p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	p = strings.TrimPrefix(p, "./")
+	p = strings.Trim(p, "/")
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	if p == "." {
+		return ""
+	}
+	return p
+}
+
+// underAny 判定 rel 是否等于某个前缀或在其之下。
+func underAny(rel string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if p == "" {
+			continue
+		}
+		if rel == p || strings.HasPrefix(rel, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDescendantIn 判定某个目录前缀下是否存在强制观察路径（用于决定是否 SkipDir）。
+func hasDescendantIn(dir string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if p == "" {
+			continue
+		}
+		if p == dir || strings.HasPrefix(p, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) blobPath(hash string) string {
 	if len(hash) < 2 {
 		return filepath.Join(s.dir, "blobs", hash)
@@ -187,6 +281,38 @@ func isExcluded(rel string, excludes []string) bool {
 			}
 		}
 		if strings.HasPrefix(rel, ex+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// observe 判定某个路径是否必须被观察（forceInclude 命中，且不是检查点自身存储）。
+func (s *Store) observe(rel string) bool {
+	if s == nil || rel == "" {
+		return false
+	}
+	if !underAny(rel, s.forceInclude) {
+		return false
+	}
+	return !s.isOwnStorage(rel)
+}
+
+// isOwnStorage 判定 rel 是否落在检查点自己的存储目录内。
+// 默认布局是 <workDir>/.bma/checkpoints 之类的子目录，必须永远排除——
+// 否则每次快照都会把上一次快照再快照一遍（无限膨胀）。
+func (s *Store) isOwnStorage(rel string) bool {
+	dir := normalizeRel(s.dir)
+	if dir == "" {
+		return false
+	}
+	// 存储目录在绝对路径上：只要工作区相对路径等于/位于存储目录之下即视为自存储。
+	// Capture 会把绝对路径转成相对路径，这里同时覆盖两种写法。
+	if rel == dir || strings.HasPrefix(rel, dir+"/") {
+		return true
+	}
+	for _, marker := range []string{".bma/checkpoints", ".bma/checkpoint"} {
+		if rel == marker || strings.HasPrefix(rel, marker+"/") {
 			return true
 		}
 	}
@@ -233,13 +359,21 @@ func (s *Store) Capture(root string) (*Snapshot, error) {
 		if rel == "." {
 			return nil
 		}
+		// 强制观察路径（受保护资源）优先于排除清单：它的父目录不能被 SkipDir。
+		forced := s.observe(rel) || hasDescendantIn(rel, s.forceInclude) && !s.isOwnStorage(rel)
 		if d.IsDir() {
-			if isExcluded(rel, s.excludes) {
+			if !forced && isExcluded(rel, s.excludes) {
+				return fs.SkipDir
+			}
+			if s.isOwnStorage(rel) {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if isExcluded(rel, s.excludes) {
+		if !s.observe(rel) && isExcluded(rel, s.excludes) {
+			return nil
+		}
+		if s.isOwnStorage(rel) {
 			return nil
 		}
 		if len(snap.Files) >= s.maxFiles {
@@ -305,6 +439,9 @@ func (s *Store) storeFile(root, rel, path string, d fs.DirEntry) (FileEntry, int
 	return FileEntry{Hash: hash, Size: int64(len(data)), Mode: uint32(info.Mode().Perm())}, int64(len(data)), nil
 }
 
+// blobTmpSeq 为 blob 临时文件名提供进程内唯一后缀（防并发写同一 blob 互相覆盖）。
+var blobTmpSeq uint64
+
 // writeBlob 内容寻址写 blob（同 hash 只写一次）。
 func (s *Store) writeBlob(hash string, data []byte) error {
 	path := s.blobPath(hash)
@@ -314,11 +451,16 @@ func (s *Store) writeBlob(hash string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("checkpoint: mkdir blob: %w", err)
 	}
-	tmp := path + ".tmp"
+	tmp := fmt.Sprintf("%s.tmp-%d-%d", path, os.Getpid(), atomic.AddUint64(&blobTmpSeq, 1))
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("checkpoint: write blob: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		// 并发写入同一 blob：另一进程先 rename 成功，目标已存在即视为成功。
+		if _, statErr := os.Stat(path); statErr == nil {
+			return nil
+		}
 		return fmt.Errorf("checkpoint: commit blob: %w", err)
 	}
 	return nil
@@ -417,12 +559,36 @@ func (s *Store) Diff(before, after *Snapshot) *MutationManifest {
 }
 
 // RestoreReport 回滚结果（供"Restore Files / Restore Task"审计）。
+//
+// 只有 Restored 覆盖全部目标且 Failed/Unavailable/Drifted 全部为空时，
+// 调用方才可以声称事务已完整回滚（I-EXEC-5）。
 type RestoreReport struct {
 	Restored    []string `json:"restored"`
 	Skipped     []string `json:"skipped"`
 	Drifted     []string `json:"drifted"`
 	Failed      []string `json:"failed"`
 	Unavailable []string `json:"unavailable"`
+}
+
+// Complete 判定本次恢复是否完整成功（无失败/缺失/漂移）。
+func (r RestoreReport) Complete() bool {
+	return len(r.Failed) == 0 && len(r.Unavailable) == 0 && len(r.Drifted) == 0
+}
+
+// Summary 人类可读的一句话结果（事件/工具错误里用）。
+func (r RestoreReport) Summary() string {
+	parts := make([]string, 0, 4)
+	parts = append(parts, fmt.Sprintf("restored=%d", len(r.Restored)))
+	if len(r.Failed) > 0 {
+		parts = append(parts, "failed="+strings.Join(r.Failed, ","))
+	}
+	if len(r.Unavailable) > 0 {
+		parts = append(parts, "unavailable="+strings.Join(r.Unavailable, ","))
+	}
+	if len(r.Drifted) > 0 {
+		parts = append(parts, "drifted="+strings.Join(r.Drifted, ","))
+	}
+	return strings.Join(parts, " ")
 }
 
 // RestoreOptions 回滚选项。
@@ -482,19 +648,16 @@ func (s *Store) Restore(root string, before, after *Snapshot, opts RestoreOption
 		path := filepath.Join(abs, filepath.FromSlash(rel))
 		want, inBefore := before.Files[rel]
 		cur, inAfter := afterFiles[rel]
-		// 外部漂移检测：当前磁盘内容与 after 指纹不一致（且该文件在 after 中存在）→ 跳过。
+		// 外部漂移检测（I-EXEC-4）：当前磁盘状态必须与 after 快照一致（存在性、
+		// 文件类型/symlink、内容 hash、mode）。任一项不符 = 外部新修改，一律跳过。
+		//
+		// 2026-11-19 验收 P1-1：旧实现只在 Lstat 成功时比对 hash，外部删除后会被
+		// 当成"本 Action 新增的文件"，反而被重建出来——覆盖了用户/其他 Agent 的删除。
 		if detectDrift {
-			if curInfo, statErr := os.Lstat(path); statErr == nil {
-				actualHash, hashErr := hashFile(path, curInfo)
-				if hashErr == nil && inAfter && actualHash != cur.Hash {
-					rep.Drifted = append(rep.Drifted, rel)
-					continue
-				}
-				if !inAfter && statErr == nil {
-					// after 中不存在（本次新增后又出现）：视为外部漂移。
-					rep.Drifted = append(rep.Drifted, rel)
-					continue
-				}
+			if drift, why := externalDrift(path, cur, inAfter); drift {
+				_ = why
+				rep.Drifted = append(rep.Drifted, rel)
+				continue
 			}
 		}
 		if !inBefore {
@@ -554,6 +717,47 @@ func (s *Store) Restore(root string, before, after *Snapshot, opts RestoreOption
 	sort.Strings(rep.Failed)
 	sort.Strings(rep.Unavailable)
 	return rep, nil
+}
+
+// externalDrift 比较磁盘当前状态与 after 快照，判定是否发生了外部变更。
+//
+// 比较维度（缺一不可）：存在性、文件类型/symlink、内容 hash、权限 mode。
+// 返回 (是否漂移, 原因) —— 原因只用于调试日志，不进报告结构。
+func externalDrift(path string, cur FileEntry, inAfter bool) (bool, string) {
+	info, statErr := os.Lstat(path)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			if inAfter {
+				// after 里有、现在没了：外部删除 → 绝不得重建。
+				return true, "deleted externally after action"
+			}
+			// after 里没有、现在也没有：一致（无需回滚）。
+			return false, ""
+		}
+		// 无法判定（权限/IO）：保守当作漂移，宁可不恢复也不覆盖未知状态。
+		return true, "stat failed: " + statErr.Error()
+	}
+	if !inAfter {
+		// after 中不存在（本 Action 删除或从未存在），却在磁盘上出现 → 外部新增。
+		return true, "appeared externally after action"
+	}
+	if isSymlink := info.Mode()&os.ModeSymlink != 0; isSymlink != cur.Symlink {
+		return true, "file type changed (symlink)"
+	}
+	if !cur.Symlink && !info.Mode().IsRegular() {
+		return true, "file type changed (non-regular)"
+	}
+	actualHash, hashErr := hashFile(path, info)
+	if hashErr != nil {
+		return true, "hash failed: " + hashErr.Error()
+	}
+	if actualHash != cur.Hash {
+		return true, "content changed externally"
+	}
+	if uint32(info.Mode().Perm()) != cur.Mode {
+		return true, "mode changed externally"
+	}
+	return false, ""
 }
 
 // hashFile 计算当前磁盘文件指纹（与 Capture 同口径）。

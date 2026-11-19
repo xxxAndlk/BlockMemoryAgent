@@ -77,8 +77,26 @@ func (s *ReactService) ensureLogicalTask(ctx context.Context, session *reactInte
 	if len(extraction.Invariants) > 0 {
 		taskInput.Invariants = extraction.Invariants
 	}
+	// 资源解析（2026-11-19 验收 P0-2）：合同必须真的带写范围，否则 enforce 下
+	// 一写入就被拒（真实编码任务无法完成），而若是信任模式自动批准又退化成无限写权。
+	scopeText := taskInput.Goal
+	if actor != "goal" && strings.TrimSpace(input) != "" {
+		scopeText = input
+	}
+	resolution := team.ResolveScope(scopeText, workDir, nil)
+	if len(resolution.WriteSet) > 0 {
+		taskInput.WriteSet = resolution.WriteSet
+		taskInput.Targets = resolution.Targets
+		// 用户纠正时收回旧写范围（只扩权不收口 = 渐进失控）。
+		taskInput.ReplaceWriteSet = actor != "goal" && team.IsCorrection(scopeText)
+	}
+	if len(resolution.ExcludedSet) > 0 {
+		taskInput.ExcludedSet = resolution.ExcludedSet
+	}
 	task, err := s.taskManager.EnsureTask(ctx, taskInput)
 	if err != nil {
+		// 合同系统故障不得当 legacy 放行（fail closed）：返回 nil 后，enforce 下的
+		// Action 管线会因 RequireContract 拒绝未限定范围的写入，并给出可恢复错误。
 		log.Printf("[logical-task] ensure failed: session=%s actor=%s err=%v", session.ID, actor, err)
 		return nil
 	}
@@ -88,8 +106,9 @@ func (s *ReactService) ensureLogicalTask(ctx context.Context, session *reactInte
 	// 观测落事件流（shadow 也能看到任务划分/继承），用 System 事件避免污染对话正文档。
 	if mode != team.LogicalTaskModeEnforce {
 		s.store.addEvent(session, eventkind.System, "System",
-			fmt.Sprintf("逻辑任务（shadow）：id=%s rev=%d 状态=%s 目标=%s",
-				task.LogicalTaskID, task.Revision, task.Status, runeEllipsis(task.Goal, 60)),
+			fmt.Sprintf("逻辑任务（shadow）：id=%s rev=%d 状态=%s 写范围=%d 禁止=%d 目标=%s",
+				task.LogicalTaskID, task.Revision, task.Status,
+				len(task.WriteSet), len(task.ExcludedSet), runeEllipsis(task.Goal, 60)),
 			"", "", "", "", "", true)
 	}
 	if mode != team.LogicalTaskModeEnforce {
@@ -150,13 +169,17 @@ func (s *ReactService) AcceptResult(ctx context.Context, sessionID string) (*tea
 		return nil, fmt.Errorf("%w: 逻辑任务未启用（agent.logical_task_mode=off）", ErrInvalidSessionState)
 	}
 	active, err := s.taskManager.ResolveActiveContract(ctx, sessionID)
-	if err != nil || active == nil {
-		// 会话可能已终态：从存储里取最近一条非 superseded 任务。
-		tasks, listErr := s.taskManager.Store().ListTasks(ctx, sessionID)
-		if listErr != nil || len(tasks) == 0 {
-			return nil, fmt.Errorf("%w: 该会话没有可接受的逻辑任务", ErrInvalidSessionState)
+	if err != nil || active == nil || !team.TaskAcceptsUserDecision(active.Status) {
+		// 会话已终态（正常结算后 active 就不再存在）：由存储层按**交付事实**查最新
+		// 可接受任务。不能用 ListTasks 数组末尾推断——列表按 revision 排序，旧任务被
+		// 多次 refine 后 revision 反而更大，会误操作已废弃任务或拒掉真正待接受的结果
+		//（2026-11-19 再次验收 P1-2）。
+		acceptable, findErr := s.taskManager.Store().FindAcceptable(ctx, sessionID)
+		if findErr != nil || acceptable == nil {
+			return nil, fmt.Errorf("%w: 该会话没有可接受的逻辑任务（需先交付：verified 或 delivered-unverified）",
+				ErrInvalidSessionState)
 		}
-		active = tasks[len(tasks)-1]
+		active = acceptable
 	}
 	return s.taskManager.Accept(ctx, active, "user")
 }
@@ -172,6 +195,56 @@ func runeEllipsis(s string, max int) string {
 		return s
 	}
 	return string(r[:max]) + "…"
+}
+
+// settleLogicalTask 会话收尾时推进任务状态（WP3/WP6 生产状态迁移，2026-11-19 验收要求）。
+//
+// 旧实现只有 accepted 一个转换点，正常任务永远停在 active，导致：
+//   - `POST /accept` 无法接受（只允许 verified/delivered-unverified）；
+//   - Evolver 闸门永远阻断，真正的"用户接受后学习"链路走不到。
+//
+// 这里按确定性的保守规则落状态（不调用 LLM、不假造 verified）：
+//   - 会话成功但无机器验收证据 → delivered-unverified（黄态，可被用户 accepted）；
+//   - 会话出错/取消 → failed（不得直接 accepted，需重新激活）；
+//   - 已是终态 → 不动（幂等）。
+func (s *ReactService) settleLogicalTask(session *reactInternalSession, outcome string) {
+	if s == nil || s.taskManager == nil || s.taskManager.Mode() != team.LogicalTaskModeEnforce || session == nil {
+		return
+	}
+	c := s.currentLogicalTask(session)
+	if c == nil || team.IsTerminalTaskStatus(c.Status) {
+		return
+	}
+	ctx := context.Background()
+	cur := c
+	if cur.Status != team.TaskStatusAwaitingVerification {
+		// 这里是**纯状态迁移**，必须用不带合同替换语义的事件：复用 refined 会写入
+		// 空 payload 的快照事件，重放时 JSON 解码失败，事件底账与投影因此不一致
+		//（2026-11-19 再次验收 P0-2）。
+		transitioned, err := s.taskManager.Transition(ctx, cur, team.TaskStatusAwaitingVerification,
+			team.LogicalEventAwaitingVerification, "session", "session turn settled")
+		if err != nil {
+			log.Printf("[logical-task] settle: awaiting_verification failed: session=%s task=%s err=%v",
+				session.ID, cur.LogicalTaskID, err)
+			return
+		}
+		cur = transitioned
+	}
+	next, kind := team.TaskStatusDeliveredUnverified, team.LogicalEventUnverified
+	if outcome != "success" {
+		next, kind = team.TaskStatusFailed, team.LogicalEventFailed
+	}
+	transitioned, err := s.taskManager.Transition(ctx, cur, next, kind, "session", "outcome="+outcome)
+	if err != nil {
+		log.Printf("[logical-task] settle: %s failed: session=%s task=%s err=%v",
+			session.ID, next, cur.LogicalTaskID, err)
+		return
+	}
+	s.attachLogicalTask(session, transitioned)
+	s.store.addEvent(session, eventkind.System, "System",
+		fmt.Sprintf("逻辑任务已结算：id=%s rev=%d 状态=%s（用户可在结果上「接受」，接受后才会产生经验沉淀）",
+			transitioned.LogicalTaskID, transitioned.Revision, transitioned.Status),
+		"", "", "", "", "", true)
 }
 
 // evolveGateBlocks 判定本次会话收尾是否必须跳过正面学习（I-LEARN-1）。

@@ -51,6 +51,15 @@ type Evidence struct {
 	// EnvironmentError 环境性失败（EBUSY/浏览器缺失/网络不可达）：
 	// 与"行为回归"分开分类（计划 R-25），既不算通过也不算代码失败——记为缺口。
 	EnvironmentError bool
+	// TaskID/Revision/ContractHash 可选绑定：提供时必须与当前合同一致，
+	// 否则视为陈旧证据（跨 revision 复用是被禁止的，见 I-VERIFY-3）。
+	TaskID       string
+	Revision     int64
+	ContractHash string
+	// Collector 采集器标识（build/dom-probe/playwright/…），审计用。
+	Collector string
+	// Artifact 采集产物引用（截图路径/DOM 快照/日志），审计用。
+	Artifact string
 }
 
 // InvariantResult 单条不变量的校验结果。
@@ -93,6 +102,7 @@ func EvaluateVerification(c *LogicalTaskContract, invariants []InvariantResult, 
 	}
 	byID := map[string]Evidence{}
 	envErr := make([]string, 0, 4)
+	stale := make([]string, 0, 4)
 	hasStatic := false
 	for _, e := range evidence {
 		if e.EnvironmentError {
@@ -109,13 +119,20 @@ func EvaluateVerification(c *LogicalTaskContract, invariants []InvariantResult, 
 		if e.Kind == EvidenceStatic {
 			hasStatic = true
 		}
-		if e.ID != "" {
-			// 同一规则多次证据：任一失败即算失败（保守）。
-			if prev, ok := byID[e.ID]; ok && !prev.Passed {
-				continue
-			}
-			byID[e.ID] = e
+		if e.ID == "" {
+			continue
 		}
+		// 证据绑定校验（I-VERIFY-3）：提供方声明了 task/revision/hash 时必须与当前
+		// 合同一致，否则视为陈旧证据——绝不拿旧 revision 的证据充当本次验收。
+		if why := evidenceBindingMismatch(c, e); why != "" {
+			stale = append(stale, e.ID+": "+why)
+			continue
+		}
+		// 同一规则多次证据：任一失败即算失败（保守）。
+		if prev, ok := byID[e.ID]; ok && !prev.Passed {
+			continue
+		}
+		byID[e.ID] = e
 	}
 	// 1/2. 不变量。
 	invSeen := map[string]bool{}
@@ -147,6 +164,7 @@ func EvaluateVerification(c *LogicalTaskContract, invariants []InvariantResult, 
 	// 3. Required 规则。
 	requiredCount := 0
 	satisfiedRequired := 0
+	satisfiedStatic := 0
 	for _, rule := range c.Acceptance {
 		if !rule.Required {
 			continue
@@ -154,7 +172,7 @@ func EvaluateVerification(c *LogicalTaskContract, invariants []InvariantResult, 
 		requiredCount++
 		if rule.Kind == EvidenceManual {
 			// 人工判定不计机器证据：除非显式提供 manual 证据，否则记为缺口。
-			if e, ok := byID[rule.ID]; ok && e.Passed {
+			if e, ok := byID[rule.ID]; ok && e.Passed && e.Kind == EvidenceManual {
 				satisfiedRequired++
 				continue
 			}
@@ -166,18 +184,32 @@ func EvaluateVerification(c *LogicalTaskContract, invariants []InvariantResult, 
 			v.Gaps = append(v.Gaps, fmt.Sprintf("必需证据缺失 %s（kind=%s）", rule.ID, rule.Kind))
 			continue
 		}
+		// I-VERIFY-1：证据必须与规则同种类。构建通过（static）不得满足 DOM 规则——
+		// 这正是 2026-11-18 事故里"EXIT=0 当验收通过"的同类错误（2026-11-19 验收 P0-3）。
+		if !evidenceKindSatisfies(rule.Kind, e.Kind) {
+			v.Gaps = append(v.Gaps, fmt.Sprintf("证据类型不匹配 %s：规则要求 %s，实际得到 %s（不得代替）",
+				rule.ID, rule.Kind, e.Kind))
+			continue
+		}
 		if !e.Passed {
 			v.Failures = append(v.Failures, fmt.Sprintf("验收规则失败 %s：%s", rule.ID, e.Detail))
 			continue
 		}
 		satisfiedRequired++
+		if e.Kind == EvidenceStatic {
+			satisfiedStatic++
+		}
 	}
-	// 4. 环境错误一律记缺口。
+	// 4. 环境错误与陈旧证据一律记缺口。
 	v.Gaps = append(v.Gaps, envErr...)
-	// "只有构建证据"识别：有必需规则、却一条都没被满足，而证据里只有构建/静态类。
-	// 这正是计划 §7.2 要单独提示的场景：构建 EXIT=0 不构成任何 Required 规则的证据。
-	if requiredCount > 0 && satisfiedRequired == 0 && hasStatic {
-		v.BuildOnlyWarning = true
+	v.Gaps = append(v.Gaps, stale...)
+	// "只有构建证据"识别（计划 §7.2 / I-VERIFY-1）：只要"已满足的必需规则全是静态类型的"，
+	// 而又存在未满足的必需规则，就必须显式提示"构建通过 ≠ 验收通过"。
+	// 单独一条未绑定的 static 证据也算（旧口径）——它不能证明任何目标。
+	if requiredCount > 0 && hasStatic {
+		if satisfiedRequired == 0 || (satisfiedRequired < requiredCount && satisfiedStatic == satisfiedRequired) {
+			v.BuildOnlyWarning = true
+		}
 	}
 	sort.Strings(v.Failures)
 	sort.Strings(v.Gaps)
@@ -201,7 +233,41 @@ func findInvariantResult(results []InvariantResult, id string) (InvariantResult,
 	return InvariantResult{}, false
 }
 
-// RenderVerdict 渲染验收结论摘要（写入交付文本/事件，便于用户看懂为什么未验证）。
+// evidenceKindSatisfies 判定证据种类是否满足规则种类（I-VERIFY-1）。
+//
+// 判定是单向的：证据种类必须**等于**规则种类，不跨层冒充。
+// 唯一的内部兼容：integration 规则接受 api 证据（API schema 校验属于集成层）。
+// 反例（必须拒绝）：static（build/lint）满足 dom/visual/unit/integration。
+func evidenceKindSatisfies(ruleKind, evidenceKind string) bool {
+	if ruleKind == evidenceKind {
+		return true
+	}
+	if ruleKind == EvidenceIntegration && evidenceKind == EvidenceAPI {
+		// api 证据可以满足 integration 规则（同一集成层，只是更具体）。
+		return true
+	}
+	return false
+}
+
+// evidenceBindingMismatch 校验证据绑定（I-VERIFY-3）：提供方若声明了
+// task/revision/hash，就必须与当前合同一致，否则是陈旧证据。
+// 未声明的字段不参与比较（兼容只提供 Kind/ID 的简单采集器）。
+func evidenceBindingMismatch(c *LogicalTaskContract, e Evidence) string {
+	if c == nil {
+		return ""
+	}
+	if e.TaskID != "" && e.TaskID != c.LogicalTaskID {
+		return "task_id 不匹配（证据属于 " + e.TaskID + "）"
+	}
+	if e.Revision > 0 && e.Revision != c.Revision {
+		return fmt.Sprintf("revision 不匹配（证据属于 rev=%d，当前 rev=%d）", e.Revision, c.Revision)
+	}
+	if e.ContractHash != "" && c.ContentHash != "" && e.ContractHash != c.ContentHash {
+		return "contract_hash 不匹配（合同已变更）"
+	}
+	return ""
+}
+
 func RenderVerdict(v VerificationVerdict) string {
 	var b strings.Builder
 	switch v.Status {

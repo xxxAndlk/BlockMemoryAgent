@@ -1274,7 +1274,24 @@ func (r *Registry) Schema() []tools.Tool {
 	// 修改已有文件的首选方式（对齐 Claude Code Edit 惯例）；仅新建文件走 WriteFile。
 	if t, err := tools.NewFunc("EditFile", "修改已存在文件的首选方式：精确局部替换，只改指定片段，不重写整个文件（输出 token 与耗时仅为整文件重写的零头）。old_string 必须与文件现有内容逐字符一致（含缩进/空格；行尾 \\r\\n 与 \\n 视为等价），默认须唯一匹配，多处匹配会报错；确需全部替换时传 replace_all=true。定位片段前可先 ReadFile 该文件的目标行段（用 offset/limit 只读相关区间，不必整读大文件）。匹配失败返回错误并附文件开头片段供自查，不会改动文件；多处匹配时在 old_string 中多带几行上下文使其唯一。新建文件用 WriteFile；改动面确实覆盖文件大半时才整写。多 Agent 并行编辑同一文件时建议带 expected_mtime（ReadFile 分页头 mtime=... 原值）：文件在读取后被他人改过会拒收并提示重读，防并发覆盖。EditFile 与 WriteFile 同等触发共享记忆/spec 失效与 .bma/snapshots 备份。", func(ctx context.Context, in editFileInput) (string, error) {
 		// 转发到内部 EditFile 工具，包含路径、old_string/new_string、replace_all 与 expected_mtime。
-		res, _ := r.Dispatch(ctx, "EditFile", map[string]any{"path": in.Path, "old_string": in.OldString, "new_string": in.NewString, "replace_all": in.ReplaceAll, "expected_mtime": in.ExpectedMtime})
+		args := map[string]any{"path": in.Path, "old_string": in.OldString, "new_string": in.NewString,
+			"replace_all": in.ReplaceAll, "expected_mtime": in.ExpectedMtime}
+		// 语义 PatchPlan（WP4）：只在调用方显式声明 semantic_kind 时透传（零行为变化）。
+		if in.SemanticKind != "" {
+			args["semantic_kind"] = in.SemanticKind
+			args["semantic_selector"] = in.SemanticSelector
+			args["semantic_property"] = in.SemanticProperty
+			args["semantic_expected_value"] = in.SemanticExpectedValue
+			args["semantic_tag"] = in.SemanticTag
+			args["semantic_anchor"] = in.SemanticAnchor
+			args["semantic_text"] = in.SemanticText
+			args["semantic_new_value"] = in.SemanticNewValue
+			args["semantic_expected_hash"] = in.SemanticExpectedHash
+			if in.SemanticExpectedMatches > 0 {
+				args["semantic_expected_matches"] = float64(in.SemanticExpectedMatches)
+			}
+		}
+		res, _ := r.Dispatch(ctx, "EditFile", args)
 		b, _ := marshalNoHTMLEscape(res)
 		return string(b), nil
 	}); err == nil {

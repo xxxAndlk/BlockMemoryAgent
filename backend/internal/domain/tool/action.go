@@ -80,6 +80,9 @@ type ActionPolicy struct {
 	ProtectedDirs []string
 	// TrustMode 会话信任模式（suggest/auto-edit/full-auto）。
 	TrustMode string
+	// RequireContract 表示"本会话必须持有合同"（logical_task_mode=enforce）。
+	// 此时 contract==nil 不得当 legacy 放行：合同系统故障必须 fail closed（2026-11-19 验收 P1-3）。
+	RequireContract bool
 }
 
 // Authorization 授权结果。
@@ -90,6 +93,10 @@ type Authorization struct {
 	// Violations 具体越界项（deny/ask 时非空）。
 	Violations []string
 	// EscalationNeeded 需要新合同版本才能放行（模型不能自行扩权）。
+	//
+	// 重要语义（2026-11-19 验收 P0-2）：这是"范围未知/越界"类 ask，**不可被
+	// full-auto 自动批准**——信任模式只能减少重复确认，不能把"合同未知"解释成
+	// "获得任意写权限"。只有合同中显式 ask 规则产生的确认请求才可自动批准。
 	EscalationNeeded bool
 }
 
@@ -135,23 +142,52 @@ func (Authorizer) Authorize(reqs []ResourceRequest, policy ActionPolicy) Authori
 				fmt.Sprintf("%s: 命中 ExcludedSet（用户明确要求不要动）", rel))
 			continue
 		}
+		// Shell 类请求（WriteSet 无法静态解析具体路径）：授权只判定"合同是否允许写"，
+		// 实际越界由执行后的真实 diff 判定与回滚（否则 enforce 下 Shell 永远不可用）。
+		if rel == "" && req.Kind == team.RuleKindPath {
+			if policy.Contract == nil {
+				if policy.RequireContract {
+					res.EscalationNeeded = true
+					decide("deny", "合同未加载，拒绝未限定范围的生产写入",
+						"Shell/写入类动作：逻辑任务合同不可用（fail closed）")
+				}
+				continue
+			}
+			if len(policy.Contract.WriteSet) == 0 {
+				// 空 WriteSet = 尚未解析 ≠ 全部允许（§3.2）：执行前即拒。
+				res.EscalationNeeded = true
+				decide("deny", "合同未解析写入范围，禁止执行（需先解析目标资源）",
+					"Shell/写入类动作：WriteSet 为空")
+			}
+			continue
+		}
 		effect, matched := matchRules(rel, req, policy)
 		switch {
 		case !matched:
-			if policy.Contract == nil || len(policy.Contract.WriteSet) == 0 {
-				res.EscalationNeeded = true
+			if policy.Contract == nil {
+				if policy.RequireContract {
+					res.EscalationNeeded = true
+					decide("deny", "合同未加载，拒绝生产写入（fail closed）",
+						fmt.Sprintf("%s: 无合同可授权", rel))
+					continue
+				}
+				// legacy 会话（未启用合同系统）：保持旧行为，只做受保护目录与 diff 审计。
+				continue
+			}
+			res.EscalationNeeded = true
+			if len(policy.Contract.WriteSet) == 0 {
 				decide("ask", "合同未解析写入范围，生产写入需要明确授权",
 					fmt.Sprintf("%s: 无写入授权（WriteSet 为空 = 尚未解析，不等于全允许）", rel))
 			} else {
-				res.EscalationNeeded = true
 				decide("ask", "写入范围不含该资源，需先扩展合同（产生新合同版本）",
 					fmt.Sprintf("%s: 不在 WriteSet 内", rel))
 			}
 		case effect == team.RuleEffectDeny:
+			res.EscalationNeeded = true
 			decide("deny", "该资源规则为 deny",
 				fmt.Sprintf("%s: 命中 deny 规则", rel))
 		case effect == team.RuleEffectAsk:
-			res.EscalationNeeded = true
+			// 显式 ask 规则 = 用户同意"可写但需确认"，可被 full-auto 自动批准。
 			decide("ask", "该资源规则要求确认", fmt.Sprintf("%s: 命中 ask 规则", rel))
 		default:
 			// allow
@@ -161,6 +197,7 @@ func (Authorizer) Authorize(reqs []ResourceRequest, policy ActionPolicy) Authori
 	res.Violations = violations
 	if res.Decision == "allow" {
 		res.Reason = ""
+		res.EscalationNeeded = false
 	}
 	return res
 }
@@ -373,29 +410,51 @@ func BuiltinCapabilities(name string) []string {
 // 解析不了（RunCommand 等）返回 CapShell 级别的"未知写入范围"标记，由管线按
 // "先快照后 diff"兜底——绝不因为参数不可解析就当作只读。
 func resolveRequestedResources(name string, args map[string]any, workDir string) []ResourceRequest {
+	return resolveRequestedResourcesWithCaps(name, args, workDir, nil)
+}
+
+// resolveRequestedResourcesWithCaps 同 resolveRequestedResources，并额外把
+// 网络/数据库类能力解析成独立的资源请求（2026-11-19 验收 P1-5：外部副作用不能
+// 混在文件资源里被一元化授权/审计）。
+func resolveRequestedResourcesWithCaps(name string, args map[string]any, workDir string, caps []string) []ResourceRequest {
+	var reqs []ResourceRequest
 	pathArg, _ := args["path"].(string)
 	switch name {
 	case "WriteFile", "EditFile", "RestoreFile":
-		return []ResourceRequest{{Kind: team.RuleKindPath, Value: relativeToWorkDir(pathArg, workDir), Write: true}}
+		reqs = []ResourceRequest{{Kind: team.RuleKindPath, Value: relativeToWorkDir(pathArg, workDir), Write: true}}
 	case "widget_delete", "widget_restore":
 		if n, _ := args["name"].(string); n != "" {
-			return []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma/widgets/" + n, Write: true}}
+			reqs = []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma/widgets/" + n, Write: true}}
+		} else {
+			reqs = []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma/widgets", Write: true}}
 		}
-		return []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma/widgets", Write: true}}
 	case "RefreshProjectDoc":
-		return []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma/PROJECT.md", Write: true}}
+		reqs = []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma/PROJECT.md", Write: true}}
 	case "WriteSharedMemory", "WriteSpec", "remember_preference", "update_evolution_prompt":
 		// 记忆/规格类写入落 .bma，不进源码写范围（但受受保护目录约束）。
-		return []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma", Write: true}}
+		reqs = []ResourceRequest{{Kind: team.RuleKindPath, Value: ".bma", Write: true}}
 	case "RunCommand":
 		// Shell 无法安全解析时按"可能写任意源码"处理：不生成伪精确路径，
 		// 只标记为 shell 写入请求，由管线用快照 diff 判定实际越界。
-		return []ResourceRequest{{Kind: team.RuleKindPath, Value: "", Write: true, Semantic: nil}}
+		reqs = []ResourceRequest{{Kind: team.RuleKindPath, Value: "", Write: true, Semantic: nil}}
+	default:
+		if pathArg != "" {
+			reqs = []ResourceRequest{{Kind: team.RuleKindPath, Value: relativeToWorkDir(pathArg, workDir), Write: true}}
+		}
 	}
-	if pathArg != "" {
-		return []ResourceRequest{{Kind: team.RuleKindPath, Value: relativeToWorkDir(pathArg, workDir), Write: true}}
+	// 网络/数据库/外部副作用能力：每类一条独立请求，值取工具名（“哪个工具触碰了外部系统”
+	// 比“触碰了哪个 URL”更可靠，且不会因为 URL 带 query 而污染审计）。
+	for _, cap := range caps {
+		switch cap {
+		case CapNetwork:
+			reqs = append(reqs, ResourceRequest{Kind: team.RuleKindNetwork, Value: name, Write: true})
+		case CapDatabase:
+			reqs = append(reqs, ResourceRequest{Kind: team.RuleKindDatabase, Value: name, Write: true})
+		case CapExternalEffect:
+			reqs = append(reqs, ResourceRequest{Kind: team.RuleKindTool, Value: name, Write: true})
+		}
 	}
-	return nil
+	return reqs
 }
 
 // relativeToWorkDir 把绝对路径转成工作区相对路径（正斜杠）；不在工作区内则返回绝对路径。

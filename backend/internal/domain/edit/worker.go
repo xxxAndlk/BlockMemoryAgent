@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,6 +79,8 @@ type Worker struct {
 	seq     int64
 	// version 由 ping 返回，用于版本不匹配时安全失败。
 	version string
+	// stderrTail 保留 worker stderr 尾（进程早退诊断）。
+	stderrTail *tailBuffer
 }
 
 // NewWorker 构造客户端（不启动进程）。
@@ -113,10 +116,21 @@ func (w *Worker) Version() string {
 func (w *Worker) Start(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.startLocked(ctx)
+	if err := w.spawnLocked(ctx); err != nil {
+		return err
+	}
+	if w.version != "" {
+		return nil // 已启动且已通过健康检查
+	}
+	return w.pingLocked(ctx)
 }
 
-func (w *Worker) startLocked(ctx context.Context) error {
+// spawnLocked 启动进程（调用方持锁）。
+//
+// 2026-11-19 验收修复：不再在这里做 ping。旧实现在**持锁**状态下调 callLocked，
+// 而 callLocked 自己又拿 w.mu（非重入）→ 必然超时/死锁，实测表现就是
+// `semantic-edit: read: EOF (code=-32099)`。现在拆成两步：起进程释放锁后再寻 ping。
+func (w *Worker) spawnLocked(_ context.Context) error {
 	if w.started {
 		return nil
 	}
@@ -130,7 +144,7 @@ func (w *Worker) startLocked(ctx context.Context) error {
 	// 工作目录固定为脚本所在目录：worker 的 node_modules 解析依赖它，
 	// 且绝不允许用户输入影响 cwd（防目录逃逸到用户项目）。
 	cmd.Dir = filepath.Dir(w.cfg.Script)
-	// 只保留最小环境：不继承用户项目的 NODE_OPTIONS（可注入 --require 任意模块）。
+	// 剔除代码注入类环境变量（详见 minimalNodeEnv 注释）。
 	cmd.Env = minimalNodeEnv()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -140,6 +154,11 @@ func (w *Worker) startLocked(ctx context.Context) error {
 	if err != nil {
 		return &WorkerError{Code: -32099, Message: "stdout_pipe: " + err.Error()}
 	}
+	// stderr 必须被消费：管道写满会让 worker 阻塞在写日志上（表现为"无响应"）。
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return &WorkerError{Code: -32099, Message: "stderr_pipe: " + err.Error()}
+	}
 	if err := cmd.Start(); err != nil {
 		return &WorkerError{Code: -32099, Message: "start: " + err.Error()}
 	}
@@ -147,11 +166,21 @@ func (w *Worker) startLocked(ctx context.Context) error {
 	w.stdin = bufio.NewWriter(stdin)
 	w.stdout = bufio.NewReaderSize(stdout, 1<<20)
 	w.started = true
-	// 健康检查：ping 失败即视为未启动（下次调用重试，不会拿半个进程硬写）。
+	// 保留 stderr 尾部：进程早退时是唯一能解释 EOF 的证据（不得丢弃）。
+	w.stderrTail = newTailBuffer(4096)
+	go func(tail *tailBuffer) {
+		_, _ = io.Copy(tail, stderr)
+	}(w.stderrTail)
+	return nil
+}
+
+// pingLocked 健康检查（调用方持锁），失败则关闭进程供下次重试。
+func (w *Worker) pingLocked(ctx context.Context) error {
 	pingCtx, cancel := context.WithTimeout(ctx, w.cfg.StartTimeout)
 	defer cancel()
 	res, err := w.callLocked(pingCtx, "ping", map[string]any{})
 	if err != nil {
+		err = w.withStderr(err)
 		w.stopLocked()
 		return err
 	}
@@ -167,22 +196,48 @@ func (w *Worker) startLocked(ctx context.Context) error {
 	return nil
 }
 
-// minimalNodeEnv 返回只含必要变量的环境（不继承 NODE_OPTIONS 等注入点）。
-func minimalNodeEnv() []string {
-	keep := map[string]bool{
-		"PATH": true, "Path": true, "PATHEXT": true, "SYSTEMROOT": true,
-		"SystemRoot": true, "TEMP": true, "TMP": true, "HOME": true, "USERPROFILE": true,
-		"APPDATA": true, "LOCALAPPDATA": true, "COMSPEC": true,
+// withStderr 把 worker 的 stderr 尾部附到错误上（诊断 EOF/启动失败必需）。
+func (w *Worker) withStderr(err error) error {
+	if err == nil || w.stderrTail == nil {
+		return err
 	}
-	out := make([]string, 0, 8)
+	if tail := strings.TrimSpace(w.stderrTail.String()); tail != "" {
+		return fmt.Errorf("%w（worker stderr: %s）", err, tail)
+	}
+	return err
+}
+
+// minimalNodeEnv 返回 worker 进程环境变量。
+//
+// 策略（2026-11-19 验收修复）：**黑名单剔除**而不是白名单保留。
+// 原先的白名单做法会连带剔掉版本管理器（volta/fnm/nvm-windows shim）用来定位真实
+// node 的环境变量（VOLTA_HOME/FNM_DIR/NVM_HOME/…），导致 shim 启动即退出、Go 侧
+// 只看到一句墓碑式的 `read: EOF`（验收报告实测：shell 里 ping 正常，Go 端稳定 EOF）。
+//
+// 真正需要防的是"向 Node 注入代码"的变量；用户内容从不进环境，worker 脚本是仓库
+// 可信代码，因此保留其余环境（含代理/区域设置/临时目录）是安全的。
+func minimalNodeEnv() []string {
+	// 代码注入 / 解释器行为接管类变量：一律剔除。
+	deny := map[string]bool{
+		"NODE_OPTIONS":                 true, // --require/--import 任意模块
+		"NODE_REPL_EXTERNAL_MODULE":    true,
+		"NODE_REPL_HISTORY":            true,
+		"NODE_EXTRA_CA_CERTS":          true, // 换根证书等于可拦截一切
+		"NODE_TLS_REJECT_UNAUTHORIZED": true, // 0 = 关证书校验
+		// ELECTRON_RUN_AS_NODE 不是代码注入参数：Windows 的 Electron 系 Node shim
+		// 必须保留它才能以 Node 模式启动；真实 node.exe 会忽略该变量。
+		"BMA_SEMANTIC_EDIT_INJECT": true, // 预留给测试的显式注入点，生产禁用
+	}
+	out := make([]string, 0, len(os.Environ()))
 	for _, kv := range os.Environ() {
 		key := kv
 		if i := strings.IndexByte(kv, '='); i > 0 {
 			key = kv[:i]
 		}
-		if keep[key] {
-			out = append(out, kv)
+		if deny[strings.ToUpper(key)] {
+			continue
 		}
+		out = append(out, kv)
 	}
 	return out
 }
@@ -212,7 +267,38 @@ func (w *Worker) stopLocked() {
 	w.version = ""
 }
 
-// Call 发起一次请求（自动启动/崩溃重启一次）。
+// tailBuffer 保留最后 N 字节（环形覆盖，内存上限固定）。
+type tailBuffer struct {
+	mu   sync.Mutex
+	max  int
+	data []byte
+}
+
+func newTailBuffer(max int) *tailBuffer { return &tailBuffer{max: max} }
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	if t == nil {
+		return len(p), nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.data = append(t.data, p...)
+	if len(t.data) > t.max {
+		t.data = t.data[len(t.data)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	if t == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.data)
+}
+
+// Call 发起一次请求（自动启动 + 健康检查；崩溃重启一次）。
 func (w *Worker) Call(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
 	if w == nil {
 		return nil, &WorkerError{Code: -32099, Message: "worker_not_initialized"}
@@ -220,7 +306,10 @@ func (w *Worker) Call(ctx context.Context, method string, params map[string]any)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.started {
-		if err := w.startLocked(ctx); err != nil {
+		if err := w.spawnLocked(ctx); err != nil {
+			return nil, err
+		}
+		if err := w.pingLocked(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -232,14 +321,30 @@ func (w *Worker) Call(ctx context.Context, method string, params map[string]any)
 	if !IsWorkerUnavailable(err) {
 		return nil, err
 	}
+	err = w.withStderr(err)
 	w.stopLocked()
-	if startErr := w.startLocked(ctx); startErr != nil {
+	if startErr := w.spawnLocked(ctx); startErr != nil {
 		return nil, startErr
 	}
-	return w.callLocked(ctx, method, params)
+	if pingErr := w.pingLocked(ctx); pingErr != nil {
+		return nil, pingErr
+	}
+	res, retryErr := w.callLocked(ctx, method, params)
+	if retryErr != nil {
+		retryErr = w.withStderr(retryErr)
+	}
+	return res, retryErr
 }
 
 // callLocked 单次往返（调用方持锁）。
+//
+// 传输层纪律（2026-11-19 再次验收返修）：
+//   - 超时后必须**杀掉进程**再返回。bufio.Reader 不支持并发读，而超时路径残留的
+//     读取 goroutine 会与下一次调用新起的 goroutine 同时读同一条管道——两个读者
+//     互相偷行，表现就是随机 `decode response: unexpected end of JSON input` /
+//     `read: EOF`。杀掉进程让孤儿 goroutine 立即收到错误退出，重启后是全新管道。
+//   - 空行跳过而不是当响应解析（某些 node/shim 会向 stdout 抖一行空行）。
+//   - 解码失败时附上原始行片段 + worker stderr 尾，避免只有一句无解的 JSON 错误。
 func (w *Worker) callLocked(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
 	w.seq++
 	reqID := fmt.Sprintf("r%d", w.seq)
@@ -260,23 +365,46 @@ func (w *Worker) callLocked(ctx context.Context, method string, params map[strin
 		return nil, &WorkerError{Code: -32099, Message: "flush: " + err.Error()}
 	}
 	// 读一行响应：用 goroutine + 超时控制（bufio 读取不可取消）。
+	// 每次重试都重新绑定**当前** reader 到局部变量，避免 goroutine 读 w.stdout
+	// 字段（stopLocked 会把它置 nil，字段级并发读写是数据竞争）。
 	type readResult struct {
 		line string
 		err  error
 	}
-	ch := make(chan readResult, 1)
-	go func() {
-		line, err := w.stdout.ReadString('\n')
-		ch <- readResult{line: line, err: err}
-	}()
-	var rr readResult
-	select {
-	case rr = <-ch:
-	case <-time.After(time.Until(deadline)):
-		return nil, &WorkerError{Code: -32098, Message: "timeout after " + w.cfg.Timeout.String()}
+	readLine := func() <-chan readResult {
+		ch := make(chan readResult, 1)
+		reader := w.stdout
+		if reader == nil {
+			ch <- readResult{err: io.EOF}
+			return ch
+		}
+		go func() {
+			line, err := reader.ReadString('\n')
+			ch <- readResult{line: line, err: err}
+		}()
+		return ch
 	}
-	if rr.err != nil {
-		return nil, &WorkerError{Code: -32099, Message: "read: " + rr.err.Error()}
+	ch := readLine()
+	var rr readResult
+	for {
+		select {
+		case rr = <-ch:
+		case <-time.After(time.Until(deadline)):
+			// 关键：孤儿读 goroutine 必须被进程退出解阻塞，否则下一次调用会出现两个读者。
+			w.stopLocked()
+			return nil, &WorkerError{Code: -32098, Message: "timeout after " + w.cfg.Timeout.String()}
+		}
+		if rr.err != nil {
+			return nil, &WorkerError{Code: -32099, Message: "read: " + rr.err.Error()}
+		}
+		if strings.TrimSpace(rr.line) != "" {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			w.stopLocked()
+			return nil, &WorkerError{Code: -32098, Message: "timeout after " + w.cfg.Timeout.String() + " (only blank lines received)"}
+		}
+		ch = readLine()
 	}
 	var resp struct {
 		RequestID string          `json:"request_id"`
@@ -285,10 +413,11 @@ func (w *Worker) callLocked(ctx context.Context, method string, params map[strin
 		Error     *WorkerError    `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(rr.line), &resp); err != nil {
-		return nil, &WorkerError{Code: -32099, Message: "decode response: " + err.Error()}
+		return nil, w.withStderr(&WorkerError{Code: -32099,
+			Message: "decode response: " + err.Error() + "（原文片段：" + previewLine(rr.line) + "）"})
 	}
 	if resp.RequestID != "" && resp.RequestID != reqID {
-		return nil, &WorkerError{Code: -32099, Message: "response id mismatch: " + resp.RequestID}
+		return nil, w.withStderr(&WorkerError{Code: -32099, Message: "response id mismatch: " + resp.RequestID})
 	}
 	if !resp.OK {
 		if resp.Error != nil {
@@ -297,6 +426,15 @@ func (w *Worker) callLocked(ctx context.Context, method string, params map[strin
 		return nil, &WorkerError{Code: -32000, Message: "worker returned failure without error detail"}
 	}
 	return resp.Result, nil
+}
+
+// previewLine 截取一行用于错误消息（避免把 4MB 响应打进日志）。
+func previewLine(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= 240 {
+		return s
+	}
+	return s[:240] + "…"
 }
 
 // --- 协议类型 ---------------------------------------------------------------
@@ -376,31 +514,43 @@ func (w *Worker) ParseSFC(ctx context.Context, p ParseSFCParams) (map[string]any
 	return out, nil
 }
 
-// ApplyUTF16Edits 把 worker 的 utf16 offset 换算成字节偏移并应用（只允许 1 条 edit）。
+// ByteRangeOfEdit 把 plan 的唯一 TextEdit 换算成字节范围 [start,end)。
 //
-// 纪律（I-EDIT-1）：调用前必须校验目标文件内容 hash 与 plan.ContentHash 一致，
-// 否则拒绝（防"读到的不是要改的那版"）。返回应用后的新内容。
-func ApplyUTF16Edits(src []byte, plan *EditPlan) ([]byte, error) {
+// 单独导出：复验要用它证明"除该范围外逐字节未变"（I-EDIT-2）。
+func ByteRangeOfEdit(src []byte, plan *EditPlan) (int64, int64, error) {
 	if plan == nil {
-		return nil, &WorkerError{Code: -32050, Message: "plan required"}
+		return 0, 0, &WorkerError{Code: -32050, Message: "plan required"}
 	}
 	if len(plan.Edits) != 1 {
-		return nil, &WorkerError{Code: -32050,
+		return 0, 0, &WorkerError{Code: -32050,
 			Message: fmt.Sprintf("expected exactly 1 edit, got %d", len(plan.Edits))}
 	}
 	e := plan.Edits[0]
 	start, err := utf16OffsetToByteOffset(src, e.Start)
 	if err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 	end, err := utf16OffsetToByteOffset(src, e.End)
 	if err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 	if start > end || end > int64(len(src)) {
-		return nil, &WorkerError{Code: -32051,
+		return 0, 0, &WorkerError{Code: -32051,
 			Message: fmt.Sprintf("invalid byte range [%d,%d) for %d-byte source", start, end, len(src))}
 	}
+	return start, end, nil
+}
+
+// ApplyUTF16Edits 把 worker 的 utf16 offset 换算成字节偏移并应用（只允许 1 条 edit）。
+//
+// 纪律（I-EDIT-1）：调用前必须校验目标文件内容 hash 与 plan.ContentHash 一致，
+// 否则拒绝（防"读到的不是要改的那版"）。返回应用后的新内容。
+func ApplyUTF16Edits(src []byte, plan *EditPlan) ([]byte, error) {
+	start, end, err := ByteRangeOfEdit(src, plan)
+	if err != nil {
+		return nil, err
+	}
+	e := plan.Edits[0]
 	out := make([]byte, 0, len(src)-int(end-start)+len(e.NewText))
 	out = append(out, src[:start]...)
 	out = append(out, e.NewText...)

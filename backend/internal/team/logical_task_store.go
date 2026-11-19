@@ -34,6 +34,15 @@ type LogicalTaskStore interface {
 	ListEvents(ctx context.Context, sessionID, taskID string) ([]LogicalTaskEvent, error)
 	// ListTasks 返回会话全部任务投影（按 revision 升序）。
 	ListTasks(ctx context.Context, sessionID string) ([]*LogicalTaskContract, error)
+	// FindAcceptable 返回会话中**当前可接受**的任务（交付事实：状态为 verified 或
+	// delivered-unverified，取最新创建/交付的那一条）。
+	//
+	// 为什么必须由存储层提供（2026-11-19 再次验收 P1-2）：`ListTasks` 按 revision 排序，
+	// 已被多次 refine 的旧 superseded 任务 revision 更大，取“数组末尾”会选错任务——
+	// 要么拒掉真正待接受的结果，要么把一个废弃任务改成 accepted。接受语义必须由
+	// 交付事实（状态 + 创建/更新时间）决定，不得用排序数组末尾推断。
+	// 无可接受任务时返回 ErrLogicalTaskNotFound。
+	FindAcceptable(ctx context.Context, sessionID string) (*LogicalTaskContract, error)
 }
 
 // ErrLogicalTaskNotFound 投影不存在（legacy 会话走 fallback）。
@@ -220,4 +229,23 @@ func (m *MemoryLogicalTaskStore) ListTasks(_ context.Context, sessionID string) 
 		return out[i].LogicalTaskID < out[j].LogicalTaskID
 	})
 	return out, nil
+}
+
+// FindAcceptable 实现 LogicalTaskStore：按**创建/交付顺序倒序**取最新可接受任务。
+//
+// 倒序遍历插入顺序（m.order 就是创建顺序），而不是按 revision 排序——revision 只在
+// 同一任务内递增，旧任务被 refine 多次后 revision 会比新任务大，用 revision 会选错。
+func (m *MemoryLogicalTaskStore) FindAcceptable(_ context.Context, sessionID string) (*LogicalTaskContract, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := m.order[sessionID]
+	for i := len(ids) - 1; i >= 0; i-- {
+		proj := m.tasks[sessionID][ids[i]]
+		if proj == nil || !TaskAcceptsUserDecision(proj.Status) {
+			continue
+		}
+		clone := *proj
+		return &clone, nil
+	}
+	return nil, ErrLogicalTaskNotFound
 }

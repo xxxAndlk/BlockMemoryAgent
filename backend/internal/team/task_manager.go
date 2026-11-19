@@ -169,6 +169,10 @@ type TaskInput struct {
 	Actor string
 	// NewTask 显式新任务（续跑默认依据规则判定）。
 	NewTask bool
+	// ReplaceWriteSet 用本次 WriteSet **替换**旧写范围而不是合并。
+	// 只在用户纠正/明确定新目标时置位（否则只会扩权不会收口，
+	// 2026-11-19 验收要求"避免只扩权不收口"）。
+	ReplaceWriteSet bool
 }
 
 // Create 创建根任务（新会话首条用户输入）。
@@ -239,7 +243,12 @@ func (m *TaskManager) Refine(ctx context.Context, active *LogicalTaskContract, i
 		next.ReadSet = append(append([]ResourceRule{}, active.ReadSet...), in.ReadSet...)
 	}
 	if len(in.WriteSet) > 0 {
-		next.WriteSet = append(append([]ResourceRule{}, active.WriteSet...), in.WriteSet...)
+		if in.ReplaceWriteSet {
+			// 用户改变目标：旧写范围作废（不是叠加），防止"越改越大"。
+			next.WriteSet = append([]ResourceRule{}, in.WriteSet...)
+		} else {
+			next.WriteSet = append(append([]ResourceRule{}, active.WriteSet...), in.WriteSet...)
+		}
 	}
 	if len(in.ExcludedSet) > 0 {
 		next.ExcludedSet = append(append([]ResourceRule{}, active.ExcludedSet...), in.ExcludedSet...)
@@ -337,6 +346,11 @@ func (m *TaskManager) Supersede(ctx context.Context, active *LogicalTaskContract
 }
 
 // Transition 状态迁移（verified / delivered-unverified / failed / cancelled）。
+//
+// payload 纪律（2026-11-19 再次验收 P0-2）：若调用方传入的 kind 属于合同快照类
+// （created/refined），必须写入**完整合同 JSON**——否则重放会因空 payload 解码失败，
+// 事件底账与投影不一致。纯状态迁移请用各自的迁移事件（如
+// LogicalEventAwaitingVerification），不要复用 refined。
 func (m *TaskManager) Transition(ctx context.Context, active *LogicalTaskContract, nextStatus, kind string, actor, reason string) (*LogicalTaskContract, error) {
 	if !m.enabled() || active == nil {
 		return active, nil
@@ -345,11 +359,24 @@ func (m *TaskManager) Transition(ctx context.Context, active *LogicalTaskContrac
 	if err := AdvanceStatus(&next, nextStatus); err != nil {
 		return active, err
 	}
+	eventPayload := ""
+	if IsContractSnapshotEvent(kind) {
+		// 防御性：即使是状态迁移，只要声明为快照类就必须带全量快照（否则重放不可用）。
+		if err := NormalizeContract(&next); err != nil {
+			return active, err
+		}
+		data, err := json.Marshal(&next)
+		if err != nil {
+			return active, fmt.Errorf("logical task: marshal %s payload: %w", kind, err)
+		}
+		eventPayload = string(data)
+	}
 	ev := LogicalTaskEvent{
 		SessionID:      next.SessionID,
 		LogicalTaskID:  next.LogicalTaskID,
 		Revision:       next.Revision,
 		Kind:           kind,
+		Payload:        eventPayload,
 		IdempotencyKey: m.nextIdemKey(next.SessionID, kind, next.LogicalTaskID, next.Revision),
 		Owner:          next.Owner,
 	}

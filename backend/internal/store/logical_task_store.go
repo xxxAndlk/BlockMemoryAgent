@@ -352,6 +352,22 @@ SELECT contract FROM logical_tasks WHERE session_id=$1 ORDER BY revision, logica
 	return out, nil
 }
 
+// FindAcceptable 实现 team.LogicalTaskStore：取会话中“等用户拍板”的最新一条交付任务。
+//
+// 选型依据是**交付事实**（status 为 verified/delivered-unverified + updated_at 倒序），
+// 不是数组末尾/最大 revision——旧任务被多次 refine 后 revision 会比新任务大，
+// 按 revision 选会误操作废弃任务（2026-11-19 再次验收 P1-2）。
+func (s *PGLogicalTaskStore) FindAcceptable(ctx context.Context, sessionID string) (*team.LogicalTaskContract, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT contract FROM logical_tasks
+WHERE session_id=$1 AND status IN ('verified','delivered-unverified')
+ORDER BY updated_at DESC, created_at DESC LIMIT 1`, sessionID)
+	return scanContract(row)
+}
+
 // --- Action 事件存储（WP2） ---------------------------------------------------
 
 // ActionEvent 一条 Action 阶段事件（append-only）。

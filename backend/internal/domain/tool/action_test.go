@@ -448,3 +448,379 @@ func TestMutationManifestEvidenceIsRealDiff(t *testing.T) {
 		t.Fatalf("manifest json must contain path: %s", payload)
 	}
 }
+
+// --- 2026-11-19 验收返修：授权/回滚语义的负面用例 ---------------------------
+
+// failingSink 审计写入总是失败（模拟 PG 不可用）。
+type failingSink struct{}
+
+func (failingSink) Append(context.Context, ActionEvent) error { return os.ErrClosed }
+
+// TestPipelineFullAutoCannotApproveScopeEscalation P0-2：
+// full-auto 只能批准"合同内显式 ask"，不得把"范围未知/越界"自动扩权。
+func TestPipelineFullAutoCannotApproveScopeEscalation(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "src/a.css", "before\n")
+	store := checkpoint.NewStore(t.TempDir())
+	p := NewActionPipeline(ActionPipelineConfig{Mode: ActionModeEnforce, Store: store})
+	// 空 WriteSet 的合同（尚未解析）——即使 full-auto 也不得执行。
+	c := contractFor(t)
+	ctx := WithLogicalTask(context.Background(), c)
+	ctx = WithSessionID(ctx, "s-test")
+	ctx = WithTrustModeFunc(ctx, func() string { return TrustModeFullAuto })
+
+	executed := false
+	res, out := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root, func() *Result {
+		executed = true
+		return &Result{Tool: "WriteFile", Success: true}
+	})
+	if executed {
+		t.Fatal("full-auto must not turn an unresolved write scope into permission")
+	}
+	if res.Success {
+		t.Fatal("empty write set must not authorise the write")
+	}
+	// ask 与 deny 都必须在执行前生效（enforce 下不执行）；不能先写再回滚。
+	if out.Decision != "ask" && out.Decision != "deny" {
+		t.Fatalf("empty write set must escalate or deny, got %+v", out)
+	}
+	if out.Executed || !out.Manifest.Empty() {
+		t.Fatalf("nothing may be written before authorization: %+v", out)
+	}
+	if got := readTemp(t, root, "src/a.css"); got != "before\n" {
+		t.Fatalf("production file must be untouched, got %q", got)
+	}
+}
+
+// TestPipelineExplicitAskRuleStillAutoApproved 合同显式 ask 规则仍可被 full-auto 批准。
+func TestPipelineExplicitAskRuleStillAutoApproved(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "src/a.css", "before\n")
+	store := checkpoint.NewStore(t.TempDir())
+	p := NewActionPipeline(ActionPipelineConfig{Mode: ActionModeEnforce, Store: store})
+	c := contractFor(t, "src/a.css")
+	c.WriteSet[0].Effect = team.RuleEffectAsk
+	if err := team.NormalizeContract(c); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithLogicalTask(context.Background(), c)
+	ctx = WithSessionID(ctx, "s-test")
+	ctx = WithTrustModeFunc(ctx, func() string { return TrustModeFullAuto })
+
+	res, out := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root, func() *Result {
+		_ = os.WriteFile(filepath.Join(root, "src/a.css"), []byte("after\n"), 0o644)
+		return &Result{Tool: "WriteFile", Success: true}
+	})
+	if out.Decision != "allow" || res == nil || !res.Success {
+		t.Fatalf("explicit ask rule must be auto-approved in full-auto: %+v %+v", res, out)
+	}
+	if got := readTemp(t, root, "src/a.css"); got != "after\n" {
+		t.Fatalf("approved write must be applied, got %q", got)
+	}
+}
+
+// TestPipelineRequireContractFailsClosedWhenContractMissing P1-3：
+// 合同系统启用（RequireContract）但合同缺失 = 故障，必须 fail closed。
+func TestPipelineRequireContractFailsClosedWhenContractMissing(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "src/a.css", "before\n")
+	store := checkpoint.NewStore(t.TempDir())
+	p := NewActionPipeline(ActionPipelineConfig{
+		Mode: ActionModeEnforce, Store: store, RequireContract: true,
+	})
+	ctx := WithSessionID(context.Background(), "s-test")
+	ctx = WithTrustModeFunc(ctx, func() string { return TrustModeFullAuto })
+
+	executed := false
+	res, _ := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root, func() *Result {
+		executed = true
+		return &Result{Tool: "WriteFile", Success: true}
+	})
+	if executed || res.Success {
+		t.Fatalf("missing contract under RequireContract must fail closed: %+v", res)
+	}
+	if got := readTemp(t, root, "src/a.css"); got != "before\n" {
+		t.Fatalf("production file must be untouched, got %q", got)
+	}
+}
+
+// TestPipelineLegacyWithoutRequireContractStillWorks legacy（未启用合同系统）保持旧行为。
+func TestPipelineLegacyWithoutRequireContractStillWorks(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "src/a.css", "before\n")
+	store := checkpoint.NewStore(t.TempDir())
+	p := NewActionPipeline(ActionPipelineConfig{Mode: ActionModeEnforce, Store: store})
+	ctx := WithSessionID(context.Background(), "s-test")
+
+	res, out := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root, func() *Result {
+		_ = os.WriteFile(filepath.Join(root, "src/a.css"), []byte("after\n"), 0o644)
+		return &Result{Tool: "WriteFile", Success: true}
+	})
+	if res == nil || !res.Success || out.Decision != "allow" {
+		t.Fatalf("legacy session (no contract system) must keep old behaviour: %+v %+v", res, out)
+	}
+}
+
+// TestRollbackOutcomeRequiresCompleteRestore P1-2：
+// 部分恢复（漂移/失败/缺失）不得被判为"已回滚"——只允许 ManualRecoveryRequired。
+func TestRollbackOutcomeRequiresCompleteRestore(t *testing.T) {
+	clean := checkpoint.RestoreReport{Restored: []string{"src/a.css"}}
+	manual, _ := rollbackOutcome(clean, nil)
+	if manual != "" {
+		t.Fatalf("clean restore must not require manual recovery: %q", manual)
+	}
+	for _, rep := range []checkpoint.RestoreReport{
+		{Restored: []string{"a"}, Drifted: []string{"src/b.css"}},
+		{Restored: []string{"a"}, Failed: []string{"src/b.css"}},
+		{Restored: []string{"a"}, Unavailable: []string{"src/b.css"}},
+	} {
+		manual, msg := rollbackOutcome(rep, nil)
+		if manual == "" {
+			t.Fatalf("partial restore must be manual recovery: %+v", rep)
+		}
+		if !strings.Contains(msg, "人工恢复") {
+			t.Fatalf("message must tell the user manual recovery is required: %q", msg)
+		}
+	}
+	manual, msg := rollbackOutcome(clean, os.ErrPermission)
+	if manual == "" || !strings.Contains(msg, "人工恢复") {
+		t.Fatalf("restore error must be manual recovery: %q", msg)
+	}
+}
+
+// TestPipelineEnforceRefusesWhenAuditUnavailable P1-5：
+// enforce 下授权/检查点事件写不进去时不得静默执行。
+func TestPipelineEnforceRefusesWhenAuditUnavailable(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "src/a.css", "before\n")
+	store := checkpoint.NewStore(t.TempDir())
+	p := NewActionPipeline(ActionPipelineConfig{
+		Mode: ActionModeEnforce, Store: store, Events: failingSink{},
+	})
+	c := contractFor(t, "src/a.css")
+	ctx := WithLogicalTask(context.Background(), c)
+	ctx = WithSessionID(ctx, "s-test")
+	ctx = WithTrustModeFunc(ctx, func() string { return TrustModeFullAuto })
+
+	executed := false
+	res, _ := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root, func() *Result {
+		executed = true
+		return &Result{Tool: "WriteFile", Success: true}
+	})
+	if executed || res.Success {
+		t.Fatalf("enforce must not execute when the audit ledger is unavailable: %+v", res)
+	}
+	if got := readTemp(t, root, "src/a.css"); got != "before\n" {
+		t.Fatalf("production file must be untouched, got %q", got)
+	}
+}
+
+// TestPipelineShadowToleratesAuditFailure shadow 下审计失败仍只记录（灰度期不阻断）。
+func TestPipelineShadowToleratesAuditFailure(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "src/a.css", "before\n")
+	p := NewActionPipeline(ActionPipelineConfig{
+		Mode: ActionModeShadow, Store: checkpoint.NewStore(t.TempDir()), Events: failingSink{},
+	})
+	c := contractFor(t, "src/a.css")
+	ctx := WithLogicalTask(context.Background(), c)
+	ctx = WithSessionID(ctx, "s-test")
+
+	res, _ := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root, func() *Result {
+		_ = os.WriteFile(filepath.Join(root, "src/a.css"), []byte("after\n"), 0o644)
+		return &Result{Tool: "WriteFile", Success: true}
+	})
+	if res == nil || !res.Success {
+		t.Fatalf("shadow must keep the old behaviour on audit failure: %+v", res)
+	}
+}
+
+// TestResolveResourcesClassifiesExternalEffects P1-5：
+// 网络/数据库/外部副作用被解析成独立资源类别（不是文件写的附属品）。
+func TestResolveResourcesClassifiesExternalEffects(t *testing.T) {
+	cases := []struct {
+		name string
+		caps []string
+		want string
+	}{
+		{"HTTPPost", []string{CapNetwork}, team.RuleKindNetwork},
+		{"schedule_task", []string{CapDatabase}, team.RuleKindDatabase},
+		{"CallExternalAgent", []string{CapExternalEffect}, team.RuleKindTool},
+	}
+	for _, c := range cases {
+		reqs := resolveRequestedResourcesWithCaps(c.name, map[string]any{}, "/tmp", c.caps)
+		found := false
+		for _, r := range reqs {
+			if r.Kind == c.want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s: expected a %q resource request, got %+v", c.name, c.want, reqs)
+		}
+	}
+	// 网络请求不应被当成文件写请求。
+	for _, r := range resolveRequestedResourcesWithCaps("HTTPPost", map[string]any{}, "/tmp", []string{CapNetwork}) {
+		if r.Kind == team.RuleKindPath {
+			t.Fatalf("network capability must not be classified as a file write: %+v", r)
+		}
+	}
+}
+
+// --- 2026-11-19 再次验收 P0-3：执行后各阶段审计失败都必须阻断成功 -------------
+
+// phaseFailSink 只在指定阶段失败（其余成功），用于逐个阶段故障注入。
+type phaseFailSink struct {
+	mu    sync.Mutex
+	phase string
+	seen  []string
+}
+
+func (s *phaseFailSink) Append(_ context.Context, ev ActionEvent) error {
+	s.mu.Lock()
+	s.seen = append(s.seen, ev.Phase)
+	s.mu.Unlock()
+	if ev.Phase == s.phase {
+		return os.ErrClosed
+	}
+	return nil
+}
+
+// TestPipelinePostExecutionAuditFailuresBlockSuccess 逐个阶段注入失败：
+// executed / mutation_observed / scope_verified / committed 任一写失败，enforce 下
+// 都不得返回成功（文件已改但底账缺行 = 不可对账）。shadow 保持旧行为。
+func TestPipelinePostExecutionAuditFailuresBlockSuccess(t *testing.T) {
+	phases := []string{
+		ActionPhaseExecuted,
+		ActionPhaseMutated,
+		ActionPhaseScopeOK,
+		ActionPhaseCommitted,
+	}
+	for _, phase := range phases {
+		phase := phase
+		t.Run(phase, func(t *testing.T) {
+			root := t.TempDir()
+			writeTemp(t, root, "src/a.css", "before\n")
+			sink := &phaseFailSink{phase: phase}
+			p := NewActionPipeline(ActionPipelineConfig{
+				Mode: ActionModeEnforce, Store: checkpoint.NewStore(t.TempDir()), Events: sink,
+			})
+			ctx := WithLogicalTask(context.Background(), contractFor(t, "src/a.css"))
+			ctx = WithSessionID(ctx, "s-test")
+			ctx = WithTrustModeFunc(ctx, func() string { return TrustModeFullAuto })
+
+			res, out := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root,
+				func() *Result {
+					writeTemp(t, root, "src/a.css", "after\n")
+					return &Result{Tool: "WriteFile", Success: true}
+				})
+			if res == nil || res.Success {
+				t.Fatalf("阶段 %s 审计失败时不得返回成功：%+v", phase, res)
+			}
+			if res.Category != ResultCategoryExecutionFailed {
+				t.Fatalf("必须归类为执行失败（需人工恢复）：%q", res.Category)
+			}
+			if !strings.Contains(res.Error, "不可信") {
+				t.Fatalf("错误必须说明底账不可对账：%q", res.Error)
+			}
+			if out.RolledBack {
+				t.Fatal("审计失败不得被当成已回滚")
+			}
+			// 磁盘上文件确实已被写过：这正是必须降级、不能声称成功的原因。
+			if got := readTemp(t, root, "src/a.css"); got != "after\n" {
+				t.Fatalf("本用例前提是写入已发生，实际 %q", got)
+			}
+		})
+	}
+}
+
+// TestPipelineShadowPostExecutionAuditFailureKeepsResult shadow 下审计失败不改变结果。
+func TestPipelineShadowPostExecutionAuditFailureKeepsResult(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "src/a.css", "before\n")
+	sink := &phaseFailSink{phase: ActionPhaseCommitted}
+	p := NewActionPipeline(ActionPipelineConfig{
+		Mode: ActionModeShadow, Store: checkpoint.NewStore(t.TempDir()), Events: sink,
+	})
+	ctx := WithLogicalTask(context.Background(), contractFor(t, "src/a.css"))
+	ctx = WithSessionID(ctx, "s-test")
+
+	res, _ := p.Run(ctx, "WriteFile", nil, map[string]any{"path": "src/a.css"}, root, func() *Result {
+		writeTemp(t, root, "src/a.css", "after\n")
+		return &Result{Tool: "WriteFile", Success: true}
+	})
+	if res == nil || !res.Success {
+		t.Fatalf("shadow 必须保留旧行为（审计失败只记日志）：%+v", res)
+	}
+}
+
+// rollbackRecoveryFailSink 在越界确认后制造一次真实漂移，可让 Restore 走
+// manual_recovery_required；随后只对指定结算阶段注入审计写失败。
+type rollbackRecoveryFailSink struct {
+	phase     string
+	driftFile string
+}
+
+func (s *rollbackRecoveryFailSink) Append(_ context.Context, ev ActionEvent) error {
+	if s.driftFile != "" && ev.Phase == ActionPhaseScopeViolate {
+		if err := os.WriteFile(s.driftFile, []byte("external drift\n"), 0o644); err != nil {
+			return err
+		}
+	}
+	if ev.Phase == s.phase {
+		return os.ErrClosed
+	}
+	return nil
+}
+
+// TestPipelineRollbackAuditFailuresRemainExplicit 覆盖执行后的三条异常结算路径。
+// 不论物理回滚是否完成，权威审计缺失都必须给出不可信的非成功结果；RolledBack
+// 只描述真实 Restore 结果，既不能虚报为 true，也不能因审计失败被篡改成 false。
+func TestPipelineRollbackAuditFailuresRemainExplicit(t *testing.T) {
+	tests := []struct {
+		name           string
+		phase          string
+		drift          bool
+		wantRolledBack bool
+		wantContent    string
+	}{
+		{name: "scope violation audit lost before rollback", phase: ActionPhaseScopeViolate,
+			wantRolledBack: false, wantContent: "after\n"},
+		{name: "completed rollback audit lost", phase: ActionPhaseRolledBack,
+			wantRolledBack: true, wantContent: "before\n"},
+		{name: "manual recovery audit lost", phase: ActionPhaseManualRecovery, drift: true,
+			wantRolledBack: false, wantContent: "external drift\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeTemp(t, root, "src/a.css", "before\n")
+			sink := &rollbackRecoveryFailSink{phase: tc.phase}
+			if tc.drift {
+				sink.driftFile = filepath.Join(root, "src", "a.css")
+			}
+			p := NewActionPipeline(ActionPipelineConfig{
+				Mode: ActionModeEnforce, Store: checkpoint.NewStore(t.TempDir()), Events: sink,
+			})
+			ctx := WithLogicalTask(context.Background(), contractFor(t, "src/other.css"))
+			ctx = WithTrustModeFunc(ctx, func() string { return TrustModeFullAuto })
+			res, out := p.Run(ctx, "RunCommand", nil, map[string]any{"command": "node edit.js"}, root,
+				func() *Result {
+					writeTemp(t, root, "src/a.css", "after\n")
+					return &Result{Tool: "RunCommand", Success: true}
+				})
+			if res == nil || res.Success || res.Category != ResultCategoryExecutionFailed {
+				t.Fatalf("审计失败必须返回明确的执行失败：result=%+v", res)
+			}
+			if !strings.Contains(res.Error, "不可信") {
+				t.Fatalf("审计丢失必须说明结果不可信及人工核对要求：%q", res.Error)
+			}
+			if out.RolledBack != tc.wantRolledBack {
+				t.Fatalf("RolledBack 必须保留真实物理结果：got=%v want=%v", out.RolledBack, tc.wantRolledBack)
+			}
+			if got := readTemp(t, root, "src/a.css"); got != tc.wantContent {
+				t.Fatalf("磁盘状态与测试前提不符：got=%q want=%q", got, tc.wantContent)
+			}
+		})
+	}
+}

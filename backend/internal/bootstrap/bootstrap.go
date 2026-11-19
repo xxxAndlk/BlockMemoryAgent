@@ -24,6 +24,7 @@ import (
 	"github.com/blockmemory/agent/backend/internal/config"
 	"github.com/blockmemory/agent/backend/internal/dag"
 	"github.com/blockmemory/agent/backend/internal/domain/checkpoint"
+	"github.com/blockmemory/agent/backend/internal/domain/edit"
 	"github.com/blockmemory/agent/backend/internal/domain/memory"
 	"github.com/blockmemory/agent/backend/internal/domain/role"
 	"github.com/blockmemory/agent/backend/internal/domain/subagent"
@@ -399,10 +400,18 @@ func Build(ctx context.Context, paths ConfigPaths) (*App, error) {
 		// 验收规则与检查点内部文件对执行角色永久 deny（I-VERIFY-2）：
 		// 这里只管 harness 强制逻辑只读，不冒充操作系统 ACL；RunCommand 事后 diff 同样覆盖。
 		Protected: []string{".bma/verification", ".bma/checkpoints"},
+		// 合同系统 enforce 时"必须有合同"：合同加载失败不得回落成 legacy 全放行
+		// （2026-11-19 验收 P1-3 fail-closed 要求）。
+		RequireContract: cfg.Agent.LogicalTaskMode == team.LogicalTaskModeEnforce,
 	})
 	toolRegistry.SetActionPipeline(actionPipeline)
 	log.Printf("[bootstrap] harness: logical_task_mode=%s action_transaction_mode=%s checkpoint=%s",
 		cfg.Agent.LogicalTaskMode, cfg.Agent.ActionTransactionMode, checkpointStore.Dir())
+
+	// 语义 PatchPlan（WP4 §8.3）：按 agent.semantic_edit_mode 接到 EditFile。
+	// off（默认）= 零行为；shadow = 只做影子定位并报告偏差；enforce = 必须命中唯一
+	// 语义目标（worker 不可用/目标歧义/指纹过期 fail closed，不回退字面替换）。
+	configureSemanticEdit(toolRegistry, cfg.Agent.SemanticEditMode, cfg.Agent.SemanticWorkerPath)
 
 	// 注入角色级写路径解析器（Layer 4）：roleID -> 该角色 Sandbox.AllowedWritePaths。
 	// 角色未配 sandbox.allowed_write_paths 时返 nil，enforceRoleWritePath 跳过，现有写行为不变。
@@ -2006,6 +2015,52 @@ func (a actionEventSinkAdapter) Append(ctx context.Context, ev tool.ActionEvent)
 		Payload:          ev.Payload,
 		CreatedAt:        ev.CreatedAt,
 	})
+}
+
+// configureSemanticEdit 按模式装配语义编辑 worker（WP4 §8.3）。
+//
+// 行为：
+//   - off     ：不创建 worker 进程（零开销、零行为）；
+//   - shadow  ：创建 worker（惰启动），EditFile 额外跑一遍定位并报告偏差；
+//   - enforce ：同 shadow，但语义定位失败时 fail closed（不回退字面替换）。
+//
+// worker 路径解析顺序（桌面安装布局与仓库开发布局不一样，必须两者都成立）：
+//  1. config 的 `agent.semantic_worker_path`（显式配置优先）；
+//  2. 环境变量 BMA_SEMANTIC_EDIT_WORKER（桌面外壳/启动器注入，指向 runtime\media\semantic-edit）；
+//  3. 仓库开发布局 `tools/semantic-edit/worker.mjs`（相对进程 cwd）。
+//
+// 路径为空/脚本不存在时只告警：enforce 不会静默降级（每次 EditFile 都会返回可诊断
+// 错误），shadow 则退化为“无法对拍”而不是伪造成功。
+func configureSemanticEdit(reg *tool.Registry, mode, workerPath string) {
+	if reg == nil {
+		return
+	}
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m == "" || m == tool.SemanticEditOff {
+		return
+	}
+	path := resolveSemanticWorkerPath(workerPath)
+	if _, err := os.Stat(path); err != nil {
+		log.Printf("[bootstrap] harness: semantic_edit_mode=%s 但 worker 不可用（%s）：%v；"+
+			"enforce 下 EditFile 将 fail closed，shadow 下仅记日志", m, path, err)
+	}
+	worker := edit.NewWorker(edit.WorkerConfig{
+		Script:  path,
+		NodeBin: strings.TrimSpace(os.Getenv("BMA_NODE_EXE")), // 桌面版随包 Node；空=走 PATH 的 node
+	})
+	reg.SetSemanticEdit(tool.SemanticEditConfig{Mode: m, Worker: worker})
+	log.Printf("[bootstrap] harness: semantic_edit_mode=%s worker=%s", m, path)
+}
+
+// resolveSemanticWorkerPath 按“配置 → 环境变量（桌面注入）→ 仓库开发布局”解析 worker 路径。
+func resolveSemanticWorkerPath(configured string) string {
+	if p := strings.TrimSpace(configured); p != "" {
+		return p
+	}
+	if p := strings.TrimSpace(os.Getenv("BMA_SEMANTIC_EDIT_WORKER")); p != "" {
+		return p
+	}
+	return filepath.Join("tools", "semantic-edit", "worker.mjs")
 }
 
 // shortHashForLog 日志里只留 hash 前 12 位（可对照、不刷屏）。
