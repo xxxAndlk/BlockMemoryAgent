@@ -1,4 +1,4 @@
-; BlockMemoryAgent 桌面版安装脚本（Inno Setup 6）
+﻿; BlockMemoryAgent 桌面版安装脚本（Inno Setup 6）
 ;
 ; 商业桌面应用的常规形态：per-user 安装（无需管理员）、自带运行时（PostgreSQL+pgvector、
 ; Redis、Node、媒体桥、Chromium）、开始菜单与桌面快捷方式、注册卸载项、缺 WebView2 时自动补装。
@@ -29,6 +29,8 @@ AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\BlockMemoryAgent
 DefaultGroupName={#MyAppName}
+; 保留"选择安装位置"页（商业软件的常规体验：双击 → 选目录 → 填配置 → 安装）。
+DisableDirPage=no
 DisableProgramGroupPage=yes
 ; per-user：装到 %LOCALAPPDATA%，不需要管理员权限（运行时数据也在其下）
 PrivilegesRequired=lowest
@@ -71,6 +73,11 @@ Source: "..\dist\setup\current\config-templates\*"; DestDir: "{app}\config"; Fla
 Source: "..\dist\setup\current\config-templates\plugins.yaml"; DestDir: "{app}\config"; Flags: ignoreversion; Check: PluginsUnchanged
 Source: "..\dist\setup\current\config-templates\plugins.yaml"; DestDir: "{app}\config"; DestName: "plugins.yaml.packaged"; Flags: ignoreversion
 Source: "..\dist\setup\current\.env.example"; DestDir: "{app}"; DestName: ".env"; Flags: onlyifdoesntexist
+; 安装向导里填的接入凭据（纯 ASCII JSON）→ 首启时由 BMA-Desktop.exe 合并进 .env。
+; 为什么绕这一步：Inno Setup 6 没有 UTF-8 文件 API（实测 SaveStringToUTF8File 不存在），
+; 而 .env 里可能有中文注释，用 ANSI 写会破坏它。改成向导写纯 ASCII 的种子 JSON，
+; Go 侧读 UTF-8/ASCII 都稳，再由它把值写进 .env。
+Source: "..\dist\setup\current\config-templates\*"; DestDir: "{app}\config"; Flags: onlyifdoesntexist recursesubdirs
 ; WebView2 引导安装程序（目标机缺运行时时才跑）
 Source: "webview2\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{app}\installer\webview2"; Flags: skipifsourcedoesntexist ignoreversion
 
@@ -98,6 +105,233 @@ Type: files; Name: "{app}\app\current.json"
 var
   OldVersion: String;
   NewVersion: String;
+
+  // 安装向导的"接入配置"页（2026-11-16）：常规商业软件的体验——双击安装包 →
+  // 选安装位置 → **填配置** → 安装完成。值只写进 config\install-seed.json（纯 ASCII），
+  // 首启时由 BMA-Desktop.exe 合并进 .env（Inno 6 没有 UTF-8 写文件 API，而 .env 含中文注释）。
+  SeedPage: TInputQueryWizardPage;
+  CfgPage: TInputOptionWizardPage;
+  SeedKey: String;
+  SeedURL: String;
+  SeedEmbedKey: String;
+  SeedEmbedURL: String;
+
+// 服务商预设：索引 ↔（接口地址，用途说明）。索引值与 Go 侧读 seed 时的 provider 字段对应。
+const
+  PROVIDER_ANTHROPIC = 0;
+  PROVIDER_DEEPSEEK = 1;
+  PROVIDER_OPENAI = 2;
+  PROVIDER_ARK = 3;
+  PROVIDER_CUSTOM = 4;
+
+function ProviderURL(Idx: Integer): String;
+begin
+  case Idx of
+    PROVIDER_ANTHROPIC: Result := 'https://api.anthropic.com';
+    PROVIDER_DEEPSEEK:  Result := 'https://api.deepseek.com/v1';
+    PROVIDER_OPENAI:    Result := 'https://api.openai.com/v1';
+    PROVIDER_ARK:       Result := 'https://ark.cn-beijing.volces.com/api/v3';
+  else
+    Result := '';
+  end;
+end;
+
+// LoadSeedFromEnv 已经有 .env 且 Key 不是占位符时，把旧值预填进向导
+// （升级重装时不要让用户重填），并把旧 URL 作为"自定义"候选。
+//
+// **不能在 InitializeWizard 里调**：那时 `{app}` 还没初始化（用户尚未走完
+// 目录选择页），ExpandConstant('{app}') 会抛
+// "An attempt was made to expand the app constant before it was initialized"。
+// 改由 CurPageChanged 在用户走到配置页时调。
+procedure LoadSeedFromEnv;
+var
+  EnvPath, Line, Key, Val: String;
+  Lines: TArrayOfString;
+  I, P: Integer;
+begin
+  SeedKey := '';
+  SeedURL := '';
+  SeedEmbedKey := '';
+  SeedEmbedURL := '';
+  EnvPath := ExpandConstant('{app}\.env');
+  if not FileExists(EnvPath) then Exit;
+  if not LoadStringsFromFile(EnvPath, Lines) then Exit;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    Line := Trim(Lines[I]);
+    if (Line = '') or (Copy(Line, 1, 1) = '#') then Continue;
+    P := Pos('=', Line);
+    if P <= 0 then Continue;
+    Key := Trim(Copy(Line, 1, P - 1));
+    Val := Trim(Copy(Line, P + 1, Length(Line)));
+    if (Length(Val) >= 2) and (Copy(Val, 1, 1) = '"') and (Copy(Val, Length(Val), 1) = '"') then
+      Val := Copy(Val, 2, Length(Val) - 2);
+    if Key = 'ANTHROPIC_API_KEY' then SeedKey := Val
+    else if Key = 'ANTHROPIC_BASE_URL' then SeedURL := Val
+    else if Key = 'EMBEDDING_API_KEY' then SeedEmbedKey := Val
+    else if Key = 'EMBEDDING_BASE_URL' then SeedEmbedURL := Val;
+  end;
+end;
+
+// PrefillSeed 把 .env 里读到的旧值填进配置页（只在第一次进入时做，不覆盖用户已改的值）。
+var
+  SeedPrefilled: Boolean;
+
+procedure PrefillSeed;
+var
+  Preset: Integer;
+begin
+  if SeedPrefilled then Exit;
+  SeedPrefilled := True;
+  LoadSeedFromEnv;
+  Preset := PROVIDER_ANTHROPIC;
+  if SeedURL <> '' then
+  begin
+    if Pos('deepseek.com', Lowercase(SeedURL)) > 0 then Preset := PROVIDER_DEEPSEEK
+    else if Pos('api.openai.com', Lowercase(SeedURL)) > 0 then Preset := PROVIDER_OPENAI
+    else if Pos('volces.com', Lowercase(SeedURL)) > 0 then Preset := PROVIDER_ARK
+    else if Pos('api.anthropic.com', Lowercase(SeedURL)) = 0 then Preset := PROVIDER_CUSTOM;
+  end;
+  CfgPage.SelectedValueIndex := Preset;
+  SeedPage.Values[0] := SeedKey;
+  SeedPage.Values[1] := SeedURL;
+  SeedPage.Values[2] := SeedEmbedURL;
+  SeedPage.Values[3] := SeedEmbedKey;
+end;
+
+procedure InitializeWizard;
+begin
+  // ① 接入方式：选服务商（预填 URL），也可自定义
+  CfgPage := CreateInputOptionPage(wpSelectDir,
+    '接入配置', '选择模型服务商',
+    'BlockMemoryAgent 需要一个模型服务的 API Key 才能工作。' + #13#10 +
+    '选好后在下一页填入 Key；不确定时选"自定义"并填接口地址。' + #13#10#13#10 +
+    '跳过也能安装：之后在应用内首启向导或设置页补齐即可。',
+    True, False);
+  CfgPage.Add('Anthropic / Claude（api.anthropic.com）');
+  CfgPage.Add('DeepSeek（api.deepseek.com）');
+  CfgPage.Add('OpenAI（api.openai.com）');
+  CfgPage.Add('火山方舟 ARK（ark.cn-beijing.volces.com）');
+  CfgPage.Add('自定义（下一页自己填接口地址）');
+
+  // ② 凭据
+  SeedPage := CreateInputQueryPage(CfgPage.ID,
+    '接入配置', '填入 API Key',
+    '这些值会被写进安装目录的 .env，之后随时能在应用内设置里修改。' + #13#10 +
+    '留空则安装完成，首次启动时再引导填写。');
+  SeedPage.Add('模型 API Key（必填）:', True);
+  SeedPage.Add('模型接口地址:', False);
+  SeedPage.Add('嵌入服务地址（可选）:', False);
+  SeedPage.Add('嵌入 API Key（可选）:', True);
+  SeedPrefilled := False;
+end;
+
+// 用户走到配置页时：预填旧值 / 把预设 URL 填进地址框。
+procedure CurPageChanged(CurPageID: Integer);
+var
+  Url: String;
+begin
+  if CurPageID = CfgPage.ID then
+    PrefillSeed;
+  if CurPageID = SeedPage.ID then
+  begin
+    PrefillSeed;
+    // 用户上次没填地址时，按选中的服务商预填（不覆盖已填的值）
+    if Trim(SeedPage.Values[1]) = '' then
+    begin
+      Url := ProviderURL(CfgPage.SelectedValueIndex);
+      if Url <> '' then SeedPage.Values[1] := Url;
+    end;
+    WizardForm.ActiveControl := SeedPage.Edits[0];
+  end;
+end;
+
+
+// IsPlaceholder 判断 Key 是不是模板占位值（与 Go 侧 placeholderKey 同口径）。
+function IsPlaceholder(const V: String): Boolean;
+var S: String;
+begin
+  S := Lowercase(Trim(V));
+  Result := (S = '') or (Pos('your-', S) > 0) or (Pos('your_', S) > 0) or
+            (Pos('change-me', S) > 0) or (Pos('changeme', S) > 0) or
+            (Pos('placeholder', S) > 0) or (Pos('sk-your', S) > 0);
+end;
+
+// HasExistingKey 探测安装目录的 .env 里是否已经有真实 Key（非占位）。
+// 升级重装时用它跳过配置页，不让用户重新填一遍。
+// 注意：必须有实际 Key 才算"配过"——.env 里的模板占位符（sk-ant-api03-your-…）
+// 会让 IsPlaceholder 返回 True（仍应弹配置页）。
+function HasExistingKey: Boolean;
+var
+  Lines: TArrayOfString;
+  I, P: Integer;
+  Line, Key, Val: String;
+begin
+  Result := False;
+  if not FileExists(ExpandConstant('{app}\.env')) then Exit;
+  if not LoadStringsFromFile(ExpandConstant('{app}\.env'), Lines) then Exit;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    Line := Trim(Lines[I]);
+    if (Line = '') or (Copy(Line, 1, 1) = '#') then Continue;
+    P := Pos('=', Line);
+    if P <= 0 then Continue;
+    Key := Trim(Copy(Line, 1, P - 1));
+    if Key <> 'ANTHROPIC_API_KEY' then Continue;
+    Val := Trim(Copy(Line, P + 1, Length(Line)));
+    if (Length(Val) >= 2) and (Copy(Val, 1, 1) = '"') and (Copy(Val, Length(Val), 1) = '"') then
+      Val := Copy(Val, 2, Length(Val) - 2);
+    Result := not IsPlaceholder(Val);
+    Exit;
+  end;
+end;
+
+// ShouldSkipPage：已经配过就不拿配置页打扰用户（升级场景）。
+// 必须在离到配置页**之前**能判定，所以不能依赖 SeedKey（那个要 CurPageChanged 才填）。
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (PageID = CfgPage.ID) or (PageID = SeedPage.ID) then
+    Result := HasExistingKey;
+end;
+
+// JsonEsc 把值转义成 JSON 字符串内容（只处理会破坏 JSON 的字符）。
+function JsonEsc(const S: String): String;
+var I: Integer; C: Char; R: String;
+begin
+  R := '';
+  for I := 1 to Length(S) do
+  begin
+    C := S[I];
+    if C = '\' then R := R + '\\'
+    else if C = '"' then R := R + '\"'
+    else if C = #13 then R := R + '\r'
+    else if C = #10 then R := R + '\n'
+    else if C = #9 then R := R + '\t'
+    else R := R + C;
+  end;
+  Result := R;
+end;
+
+// WriteInstallSeed 把向导里填的值写成 config\install-seed.json（纯 ASCII）。
+// 不用 .env 直接写：Inno 6 没有 UTF-8 文件 API，SaveStringToFile 按 ANSI 写
+// 会搞坏 .env 里的中文注释；而且 .env 可能已被用户改过，合并逻辑留在 Go 侧更安全。
+procedure WriteInstallSeed;
+var
+  Json, Dir: String;
+begin
+  if IsPlaceholder(SeedPage.Values[0]) then Exit;   // 没填 = 不写种子，首启再引导
+  Dir := ExpandConstant('{app}\config');
+  ForceDirectories(Dir);
+  Json := '{' + #13#10 +
+    '  "model_api_key": "' + JsonEsc(Trim(SeedPage.Values[0])) + '",' + #13#10 +
+    '  "model_base_url": "' + JsonEsc(Trim(SeedPage.Values[1])) + '",' + #13#10 +
+    '  "embed_base_url": "' + JsonEsc(Trim(SeedPage.Values[2])) + '",' + #13#10 +
+    '  "embed_api_key": "' + JsonEsc(Trim(SeedPage.Values[3])) + '",' + #13#10 +
+    '  "provider": "' + JsonEsc(IntToStr(CfgPage.SelectedValueIndex)) + '"' + #13#10 +
+    '}' + #13#10;
+  SaveStringToFile(ExpandConstant('{app}\config\install-seed.json'), Json, False);
+end;
 
 function WebView2RuntimePresent: Boolean;
 var
@@ -231,6 +465,8 @@ begin
   end;
   if CurStep = ssPostInstall then
   begin
+    // 把安装向导里填的接入凭据落成种子文件，首启时由 BMA-Desktop.exe 合并进 .env。
+    WriteInstallSeed;
     // 新版本号来自载荷里的 version.txt（[Files] 已把它铺到 {app}\app）。
     NewVersion := ReadTextFile(ExpandConstant('{app}\app\version.txt'));
     if OldVersion = NewVersion then

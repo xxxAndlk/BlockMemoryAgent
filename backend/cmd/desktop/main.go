@@ -176,6 +176,11 @@ func runApp(root, base string) {
 
 	// 依赖自举与后端拉起放后台：主 goroutine 留给 WebView2 消息泵。
 	go func() {
+		// 安装向导里填的凭据（config\install-seed.json）先合并进 .env：
+		// 用户已经在安装时选好服务商 + 填了 Key，就不该再弹一次首启向导。
+		if applyInstallSeed(root) {
+			w.Dispatch(func() { setProgress(w, "已应用安装时的接入配置 ...") })
+		}
 		if st := checkSetup(root); st.NeedModel || st.NeedEmbed {
 			w.Dispatch(func() { w.SetHtml(wizardHTML(st)) })
 			gate.wait()

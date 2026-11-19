@@ -1,17 +1,23 @@
 ﻿<#
 .SYNOPSIS
-BlockMemoryAgent 桌面版：**装 / 更新 / 回退** 一条脚本搞定。
+BlockMemoryAgent 桌面版：打包 / 分发 / 安装 / 更新 / 回退。
 
 .DESCRIPTION
-把仓库打成"版本化 + 可回滚"的桌面应用包，并安装或更新到目标目录。
+把仓库打成一个**自包含安装程序**（setup.exe），或者把包装到本机某个目录。
 
-日常只有三个动作（都在这一个脚本里）：
+**交付给别人（标准桌面软件形态）**：
+  pwsh -File .\bma-app.ps1 dist
+  → dist\installer\BlockMemoryAgent-Setup-<版本>.exe
+  用户双击这个 exe → 选安装位置 → 填模型 Key / 接口地址 → 安装完成 → 自动开窗口。
+  目标机零外部依赖（PostgreSQL+pgvector / Redis / Node / Chromium 全在包里）。
+
+**开发机自用（不产安装包，直接装到某个目录）**：
   pwsh -File .\bma-app.ps1 install  -Target <安装目录>   # 装 / 更新（不带 -From 就地构建）
   pwsh -File .\bma-app.ps1 rollback -Target <安装目录>   # 回退到上一版
   pwsh -File .\bma-app.ps1 status   -Target <安装目录>   # 看版本 / 运行态 / 健康
+  pwsh -File .\bma-app.ps1 shortcuts -Target <安装目录>  # 重建桌面/开始菜单入口
 
-分发给别人装（产出自包含安装包，目标机零外部依赖）：
-  pwsh -File .\bma-app.ps1 dist                          # = 打包 + 编译 Inno 安装包
+**发布更新**：
   pwsh -File .\bma-app.ps1 publish -BaseUrl <地址>        # 自动更新清单（latest.json）
 
 安装目录布局（-Target，默认 %LOCALAPPDATA%\Programs\BlockMemoryAgent）：
